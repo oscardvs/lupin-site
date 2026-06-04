@@ -1,0 +1,227 @@
+---
+title: Mission orchestrator
+description: A single ROS 2 node drives a hierarchical state machine over Nav2 and the greenhouse bridge to run inspection and frontier-exploration missions.
+---
+
+The mission orchestrator is the brain of a Lupin run. One `rclpy` node (`mission_orchestrator`, in `lupin_mission/node.py`) owns a hierarchical state machine built on the [`transitions`](https://github.com/pytransitions/transitions) library, drives [Nav2](/docs/navigation) through tag-based greenhouse routines, calls the [greenhouse bridge](/docs/greenhouse-bridge) for each tag reading, and broadcasts every result as a typed `lupin_msgs/Observation` so the [digital twin](/docs/digital-twin) and [web console](/docs/web-hmi) react in real time.
+
+It does **not** auto-run on bring-up. The node idles in `READY` and is driven entirely by operator services, `/mission/start` is the only thing that puts it to work.
+
+## The lifecycle
+
+The top-level state machine walks a fixed lifecycle. `PREPARE` branches to one of two working states by mission type, `EXPLORING` (ExplorationMission) or `INSPECTING` (InspectionMission), and `FAULT` is reachable from anywhere and terminal. `MONITORING` is not entered directly from `PREPARE`; an `ExplorationMission` reaches it from `EXPLORING` once enough tags are discovered.
+
+```text
+                          ┌─ (InspectionMission) ─► INSPECTING ─┐
+BOOT ─► READY ─► PREPARE ──┤                                    ├─► RETURNING ─► DONE
+                          └─ (ExplorationMission) ► EXPLORING   │
+                                                       └─► MONITORING ◄┘ (loops)
+                       │                                          │
+                       └──────────► (FAULT) ◄────────────────────┘
+                                                                  │
+                                                                  └──► READY (next)
+```
+
+| State | What happens |
+|---|---|
+| `BOOT` | Wait up to `dependency_timeout_s` (default `30.0`) for the Nav2 action server and the bridge service (plus `/perception/confirm_tag` if the visual gate is on). Timeout → `FAULT`. |
+| `READY` | Idle. Accepts `/mission/start`. |
+| `PREPARE` | Wraps a single `LOCALIZING` child, gates on AMCL covariance before any goal is sent. |
+| `EXPLORING` | Frontier-explore the live SLAM `/map` until `discovery_goal` distinct tags are seen. *ExplorationMission only.* |
+| `INSPECTING` | Per-tag `NAVIGATING → SCANNING → PUBLISHING` loop over a fixed tag list, once through. |
+| `MONITORING` | Same sub-machine as `INSPECTING`, but loops forever over discovered tags. *ExplorationMission only.* |
+| `RETURNING` | Drive the `dock_pose` (default `[0.0, 0.0, 0.0]`). Nav failure here is non-fatal, still `→ DONE`. |
+| `DONE` | Logs a summary. A fresh `/mission/start` bounces through `READY` for the next mission. |
+| `FAULT` | Terminal. The node stays alive for introspection but rejects future starts. |
+
+The HSM topology lives in a pure-data free function, `build_hsm_spec()` (`node.py:98`), so the docs/diagram exporter can build it without standing up a ROS node. Nested states use the default `_` separator from `transitions`, so e.g. the navigating sub-state of inspection is `INSPECTING_NAVIGATING`.
+
+### The shared scan sub-machine
+
+`INSPECTING` and `MONITORING` use the *exact same* `NAVIGATING → SCANNING → PUBLISHING` sub-machine. The on-enter handlers for both delegate to the same `_enter_navigating` / `_enter_scanning` / `_enter_publishing` methods.
+
+```text
+NAVIGATING ──nav_succeeded──► SCANNING ──scan_done──► PUBLISHING ──next_tag──► NAVIGATING
+     │                                                     │
+     └──nav_unreachable──────────────────────────────────►┘──inspection_complete──► RETURNING
+```
+
+- **NAVIGATING** issues `NavigateToPose` for the current tag's approach pose, with retry up to `nav_max_attempts` (default `2`, total attempts, *not* retries).
+- **SCANNING** calls the greenhouse bridge (and, on hardware, `/perception/confirm_tag` first).
+- **PUBLISHING** is a named advance gate: the observation was already published upstream; here the cursor advances and the machine fires `next_tag` or `inspection_complete`.
+
+The *only* behavioural difference between the two missions is the cursor. `InspectionMission`'s cursor runs out, so `is_complete()` eventually returns true and `PUBLISHING` fires `inspection_complete` → `RETURNING`. `MonitoringMission`'s cursor wraps modulo the tag count and `is_complete()` stays false forever, so `PUBLISHING` always fires `next_tag`. The loop only ends when the operator pauses or aborts.
+
+## The two mission types
+
+`/mission/start` picks one via the `mission_type` field. Unknown values are rejected.
+
+### InspectionMission (default)
+
+Visits a fixed, a-priori list of AprilTags once, scans each, returns home. The tag sequence is resolved with this precedence:
+
+1. An explicit `tag_sequence` in the request.
+2. The preset `tag_sequence` parameter.
+3. All tags from `tag_locations.json`, sorted in numeric-string order.
+
+Unknown tag ids in the sequence reject the request before any motion.
+
+<Tabs items={['Simulation','Hardware']}>
+<Tab value='Simulation'>
+
+```bash
+ros2 service call /mission/start lupin_msgs/srv/StartMission \
+  "{mission_type: 'InspectionMission', tag_sequence: []}"
+```
+
+</Tab>
+<Tab value='Hardware'>
+
+```bash
+# Visit a subset; hardware operators usually also set
+# require_visual_confirmation:=true at launch (see below).
+ros2 service call /mission/start lupin_msgs/srv/StartMission \
+  "{mission_type: 'InspectionMission', tag_sequence: ['1','5','12']}"
+```
+
+</Tab>
+</Tabs>
+
+### ExplorationMission
+
+`PREPARE` branches to `EXPLORING`: the orchestrator frontier-explores the live SLAM `/map` until `/perception/discovered_tags` reports `discovery_goal` distinct tag ids, then transitions to `MONITORING` and re-scans those tags continuously. If the request's `discovery_goal` is `0`, the orchestrator's `discovery_goal` parameter default (`5`) is used; a non-positive resolved goal is rejected.
+
+```bash
+ros2 service call /mission/start lupin_msgs/srv/StartMission \
+  "{mission_type: 'ExplorationMission', discovery_goal: 5}"
+# EXPLORING (drives to frontiers) → MONITORING (loops over the found tags)
+# /mission/abort stops the loop and returns home.
+```
+
+A hard `exploration_timeout_s` (default `180.0`) bounds the search. On lapse, the machine switches to `MONITORING` if any tags were found, otherwise straight to `RETURNING`.
+
+<Callout type="info">
+  The user-facing `mission_type` in `/mission/state` stays `"ExplorationMission"` across the `EXPLORING → MONITORING` handoff even though the underlying model object swaps from `ExplorationMission` to `MonitoringMission`.
+</Callout>
+
+## The frontier explorer
+
+`frontier.select_frontier_goal()` is pure Python, no `numpy`, no `rclpy`, so it unit-tests against synthetic grids and the orchestrator calls it directly. It reads the `nav_msgs/OccupancyGrid` body of the live SLAM `/map` and returns the map-frame `(x, y)` of the best frontier, which the orchestrator turns into an ordinary `NavigateToPose` goal (Nav2's planner already allows unknown space).
+
+The algorithm:
+
+1. **Frontier mask**, a cell is a frontier if it is free (`0 <= v <= frontier_free_thresh`, default `20`) and 4-adjacent to at least one `UNKNOWN` (`-1`) cell.
+2. **Clearance**, drop any frontier cell within `frontier_robot_radius_cells` (default `4`) of an occupied cell (`v >= frontier_occupied_thresh`, default `65`), so the robot fits.
+3. **Cluster**, 8-connected flood-fill of the surviving cells; clusters smaller than `frontier_min_cluster_cells` (default `6`) are discarded as SLAM noise.
+4. **Score & pick**, each cluster scores `size / (1 + distance_to_robot_m)` (size only when no robot pose is available). The winning cluster returns the real member cell nearest its centroid, guaranteed free and unknown-adjacent, never an averaged hole.
+
+The robot's live pose for that distance term comes from the `map → base_link` TF lookup (`_robot_xy`), *not* AMCL, in SLAM mode `/amcl_pose` is a static seed.
+
+## Per-tag approach poses
+
+`tag_locations.json` gives each tag an `(x, y)` only, no orientation. The orchestrator synthesises the missing yaw from table geometry in `approach.compute_approach()`:
+
+1. Pick the **nearest table** by bbox-centre distance (lexicographic tiebreak on table id, for determinism across runs and tests).
+2. The tag's **outward normal** is the unit vector from that table's centre to the tag, pointing away from the plant bed.
+3. The goal pose is `tag + standoff * normal`, with yaw pointing back at the tag so the front-facing camera frames the AprilTag head-on.
+4. If geometry can't run (no tables loaded, or tag at the table centre), fall back to the global `approach_yaw` parameter and `derived_from='fallback'`.
+
+Standoff is clamped to **`[0.2, 1.5]` m** (`MIN_STANDOFF_M` / `MAX_STANDOFF_M` in `approach.py`): 0.2 m keeps a 100 mm tag at a usable size on the Orbbec, beyond 1.5 m detection gets unreliable. Every nav goal logs `derived_from=geometry|override|fallback` plus the picked `table` and `standoff`, so operators can read the chosen path off stdout.
+
+`MONITORING` tags have no a-priori table, so `compute_discovered_approach()` derives the standoff from the discovered tag's own facing normal (its local +Z axis projected onto the map XY plane), falling back to the robot→tag vector when that normal degenerates.
+
+### Per-tag overrides
+
+When the heuristic doesn't match reality, leaf occlusion, a shelf-mounted tag, window glare, drop a partial or full override into the `approach_overrides_file` YAML. It is loaded once at startup without rebuilding code; a misconfigured file logs an error and continues with no overrides rather than blocking start-up.
+
+```yaml
+overrides:
+  "12":                       # partial: tighter standoff, geometry yaw + position kept
+    standoff: 0.35
+  "17":                       # full: bypass geometry entirely
+    goal_x: 4.10
+    goal_y: 5.83
+    yaw: 3.14
+    standoff: 0.4
+```
+
+Any subset of `goal_x` / `goal_y` / `yaw` / `standoff` is allowed; missing fields fall through to the geometry result. A full override (all of `goal_x`, `goal_y`, `yaw`) short-circuits the geometry path.
+
+## Localization gates
+
+There are **two tiers**, chosen by mission type in `_nav_localization_ok()`.
+
+- **InspectionMission, tight covariance gate.** Before *every* `NavigateToPose`, the orchestrator re-checks `max(cov[0], cov[7], cov[35])` (the x / y / yaw diagonal of the latest `/amcl_pose`) against `nav_localization_cov_threshold` (default `0.25`). The start-of-mission gate in `PREPARE.LOCALIZING` catches "we never localized"; this per-leg gate catches drift accumulated over a long patrol (a kidnap, a low-feature aisle). On failure no goal is sent, the tag is marked `UNREACHABLE` with `status_detail=amcl_drift_var=<value>` and the mission advances.
+- **EXPLORING / MONITORING, presence-only gate.** These run in SLAM mode where `/amcl_pose` is a static seed, so the tight gate would wrongly fail every leg. They only require that *some* pose has arrived and trust `slam_toolbox`'s `map → odom`.
+
+<Callout type="info">
+  The three QoS-latched subscriptions, `/amcl_pose`, `/map`, `/perception/discovered_tags`, are `RELIABLE + TRANSIENT_LOCAL` depth 1 to match their latched publishers. Mismatch the durability and the topic stays silently empty. (`/e_stop_state` is a separate `RELIABLE + VOLATILE` subscription.)
+</Callout>
+
+## Pause and E-stop are flags, not states
+
+Pause and E-stop never change the lifecycle state. They set flags that freeze the active sub-state in place and cancel the in-flight Nav2 goal. `_is_blocked()` (`self._paused or self._estop_engaged`) is checked by every on-enter handler and watchdog branch.
+
+- **`/e_stop_state` rising edge** cancels the in-flight goal and sets *both* `estop_engaged` and `paused`. The falling edge clears only `estop_engaged`, release deliberately does **not** auto-resume.
+- **`/mission/resume`** is the only thing that unblocks. It clears `paused` and re-kicks the active state's action (`_kick_current_state`), and is rejected while the E-stop is still engaged.
+- **Operator cancels refund the retry counter.** A pause / E-stop / abort / skip that cancels a goal mid-flight decrements the per-tag `nav_attempts` counter (`_cancel_inflight_nav(..., refund_attempt=True)`), that attempt never got a chance to fail naturally, so it shouldn't burn a retry. Nav2-internal failures (`ABORTED`, rejected, timeout) keep the attempt counted.
+
+## Operator services
+
+All four control services are `std_srvs/srv/Trigger`; `start` is the custom `StartMission`.
+
+| Service | Type | Effect |
+|---|---|---|
+| `/mission/start` | `lupin_msgs/srv/StartMission` | Begin a mission. Rejected in `FAULT`, while a mission runs, on unknown `mission_type`, non-positive `discovery_goal`, or unknown tag ids. Returns `accepted`, `mission_id` (`<mission_id_prefix>-<uuid8>`), `error_message`. |
+| `/mission/pause` | `std_srvs/srv/Trigger` | Cancel the in-flight goal, set the `paused` flag. Rejected if no active mission or already paused. |
+| `/mission/resume` | `std_srvs/srv/Trigger` | Clear `paused`, re-kick the active action. Rejected if not paused or while E-stop is engaged. |
+| `/mission/abort` | `std_srvs/srv/Trigger` | Cancel the goal and route to `RETURNING`. For `InspectionMission`, marks every remaining tag `SKIPPED` (one observation each). An abort from `PREPARE` is treated as a soft `FAULT`. |
+| `/mission/skip_current` | `std_srvs/srv/Trigger` | Mark the current tag `SKIPPED` (`status_detail=skipped_by_operator`), emit its observation, advance. Valid only during `INSPECTING`. |
+
+## Status and observations
+
+Two publishers carry mission state outward:
+
+- **`/mission/state`**, `lupin_msgs/MissionState`, published at `state_publish_rate_hz` (default `5.0`) whenever the node is alive, QoS `RELIABLE + TRANSIENT_LOCAL` depth 1 (latched, so late subscribers see the current snapshot). Carries `lifecycle_state`, `mission_phase`, `current_target`, the `targets_*` counters, `tags_discovered` / `discovery_goal` during exploration, `last_error`, `estop_engaged`, `paused`, and `started_at`. The `mission_phase` field surfaces `CONFIRMING` while `/perception/confirm_tag` is in flight, distinct from the umbrella `SCANNING` state.
+- **`/floranova/observations`**, `lupin_msgs/Observation`, one event per closed tag (`OK` / `UNREACHABLE` / `SCAN_FAILED` / `SKIPPED`), QoS `RELIABLE + TRANSIENT_LOCAL` depth 50, so a late subscriber sees the mission so far. `tag_pose_in_map` is populated from the latest AMCL snapshot **only** on `STATUS_OK`; on any non-OK result it stays zero (`orientation.w == 0`), the "missing" sentinel the digital twin expects.
+
+```bash
+ros2 topic echo /mission/state                # 5 Hz status snapshot
+ros2 topic echo /floranova/observations       # one per tag completion
+```
+
+## Failure policy
+
+| Event | Effect | Observation? |
+|---|---|---|
+| Nav2 `ABORTED`/`CANCELED`/`nav_timeout_s` | Retry until `nav_max_attempts`. | Final failure only: `UNREACHABLE`, empty `tag_reading`. |
+| Per-leg AMCL drift > `nav_localization_cov_threshold` | Refuse goal, advance. | `UNREACHABLE`, `status_detail=amcl_drift_var=<value>`. |
+| Visual confirm `detected=false` / `visual_confirmation_timeout_s` | Mark `SCAN_FAILED`, advance. | `SCAN_FAILED`, detail = perception's `error_message` or `confirm_timeout`. |
+| Bridge unknown tag / exception / `scan_timeout_s` | Mark `SCAN_FAILED`, advance. | `SCAN_FAILED`, detail = bridge error or `scan_timeout`. |
+| `/mission/skip_current` | Cancel goal, advance. | `SKIPPED`, `status_detail=skipped_by_operator`. |
+| `/mission/abort` | Cancel goal, mark remaining `SKIPPED`, `→ RETURNING`. | One `SKIPPED` per remaining tag. |
+| E-stop mid-mission | Cancel goal, freeze. | None, observations resume after `/mission/resume`. |
+| Nav2 fail in `RETURNING` | Log, `→ DONE` anyway. | None. |
+| `dependency_timeout_s` / `localization_timeout_s` lapse | `→ FAULT`. | None. |
+
+## Bring-up
+
+The launch file starts only the orchestrator; Nav2 and the bridge must already be running.
+
+```bash
+# Runtime deps that aren't in rosdep
+pip install 'mdp-greenhouse>=1.0.7,<2' 'transitions>=0.9'
+
+ros2 launch lupin_mission mission.launch.py
+```
+
+<Callout type="warn">
+  `tag_sequence` and `dock_pose` are array-typed and are **not** wired through launch arguments. Set them with `--ros-args -p` or a YAML param file.
+</Callout>
+
+<Cards>
+  <Card title="Navigation" href="/docs/navigation">Nav2, MPPI, and the SLAM/AMCL modes the gates depend on.</Card>
+  <Card title="Perception" href="/docs/perception">The aggregator behind `/perception/discovered_tags` and `/perception/confirm_tag`.</Card>
+  <Card title="Interfaces" href="/docs/interfaces">`MissionState`, `Observation`, and `StartMission` field by field.</Card>
+  <Card title="Web HMI & voice" href="/docs/web-hmi">The console that subscribes to `/mission/state` and calls these services.</Card>
+</Cards>

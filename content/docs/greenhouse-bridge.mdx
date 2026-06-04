@@ -1,0 +1,179 @@
+---
+title: Greenhouse bridge
+description: The ROS 2 service wrapper around the course mdp-greenhouse simulator that serves per-tag climate readings on demand to the mission stack.
+---
+
+Environmental sensing in Lupin is **not** simulated in Gazebo. Instead of physics-modelling temperature, humidity, CO₂, light and soil moisture across the greenhouse, the robot navigates to a physical tag, identifies it, and asks this bridge for that tag's readings. The bridge holds one long-lived `GreenhouseSimulator` instance in-process and exposes it behind a single ROS 2 service, so the rest of the stack consumes climate data through a stable contract regardless of where the numbers come from.
+
+The package wraps the course-provided [`mdp-greenhouse`](https://pypi.org/project/mdp-greenhouse/) Python simulator and runs **standalone, no Gazebo dependency**. The same `GetTagReading(tag_id)` call works unchanged once a real AprilTag detector lands and produces real IDs, because the tag IDs match those baked into the generated greenhouse SDF.
+
+## Why a query, not a sensor
+
+Climate readings are only meaningful at a moment the mission chooses: the robot has reached an approach pose, confirmed the tag, and wants *this* tag's data *now*. A fixed-rate publisher would stream values for tags the robot is nowhere near, and only the mission node knows when a reading is actionable.
+
+So the bridge exposes exactly one interface, an on-demand request/response service. A publisher loop was considered and deliberately rejected during design.
+
+<Callout type="info">
+  This is single-interface by design. There is no topic, no latched state, and no
+  fixed-rate poll. If a second consumer ever needs streamed readings, that is a new,
+  explicitly-justified interface, not a default.
+</Callout>
+
+## The service
+
+| Name | Type |
+| --- | --- |
+| `~/get_tag_reading` (resolves to `/greenhouse_bridge/get_tag_reading`) | `lupin_msgs/srv/GetTagReading` |
+
+The request is a single `string tag_id`. The response carries a status code, a human-readable `error_message`, and the reading itself:
+
+```text
+# GetTagReading.srv
+string tag_id
+---
+uint8 STATUS_OK=0
+uint8 STATUS_UNKNOWN_TAG=1
+
+uint8 status
+string error_message    # empty when status == STATUS_OK
+TagReading reading      # populated when STATUS_OK; default-zeroed otherwise
+```
+
+If `tag_id` is not in the loaded greenhouse, the handler returns `STATUS_UNKNOWN_TAG` with a populated `error_message` (`"Tag '<id>' is not in the loaded greenhouse (<n> tags known)."`) and a default-zeroed `reading`. Otherwise it returns `STATUS_OK`.
+
+### What a reading contains
+
+A `TagReading` bundles every sensor exposed at one tag:
+
+```text
+# TagReading.msg
+string tag_id                       # matches mdp-greenhouse tag IDs
+builtin_interfaces/Time stamp       # wall-clock time the bridge polled the sim
+float64 sim_time_of_day_seconds     # sim-internal time of day in [0, 86400)
+SensorReading[] readings            # one entry per sensor at this tag
+```
+
+Each `SensorReading` is a flat name/value pair:
+
+```text
+# SensorReading.msg
+string name      # e.g. "temperature", "humidity", "co2", "light", "soil_moisture"
+float64 value    # value in the sensor's natural units (sim is unit-agnostic)
+```
+
+The handler iterates `self._sim.get_sensor_data(tag_id)`, skips the `'timestamp'` key, and appends one `SensorReading` per remaining sensor. The set of sensors is a subset of the five default types and varies per tag, the message carries whatever the simulator exposes for that tag, no more.
+
+## Two clocks, kept separate
+
+A single reading carries two distinct notions of time, and the bridge never conflates them:
+
+- `stamp` is **wall-clock** (`get_clock().now()`), recording when the bridge polled the simulator.
+- `sim_time_of_day_seconds` is the simulator's internal greenhouse day-clock in `[0, 86400)`, read from `self._sim.current_time()`.
+
+The package intentionally does **not** use ROS `use_sim_time`. The simulator runs its own day-cycle on its own speedup factor; the ROS-side stamp is independent of it.
+
+## Concurrency model
+
+The single `GreenhouseSimulator` instance is mutated and read only inside the service handler, which is bound to a `MutuallyExclusiveCallbackGroup`:
+
+```python
+self._cb_group = MutuallyExclusiveCallbackGroup()
+self._service = self.create_service(
+    GetTagReading,
+    '~/get_tag_reading',
+    self._handle_get_tag_reading,
+    callback_group=self._cb_group,
+)
+```
+
+This guarantees at most one handler runs at a time, so the simulator is never touched concurrently, and that guarantee holds even if the executor is later swapped to a multi-threaded one. The threading model is explicit rather than incidental.
+
+## Launch
+
+<Tabs items={['Simulation','Hardware']}>
+<Tab value='Simulation'>
+
+```bash
+ros2 launch lupin_greenhouse_bridge greenhouse_bridge.launch.py
+```
+
+</Tab>
+<Tab value='Hardware'>
+
+The launch command is identical on hardware, the bridge has no Gazebo dependency and runs the same simulator in-process either way. Only the source of `tag_id` changes: in sim the mission supplies the baked SDF IDs; on the robot a live AprilTag detector produces them.
+
+```bash
+ros2 launch lupin_greenhouse_bridge greenhouse_bridge.launch.py
+```
+
+</Tab>
+</Tabs>
+
+This brings up one node, `greenhouse_bridge`, advertising the service above and nothing else.
+
+### Smoke test
+
+From a second shell:
+
+```bash
+ros2 service call /greenhouse_bridge/get_tag_reading \
+  lupin_msgs/srv/GetTagReading "{tag_id: '1'}"
+```
+
+A known tag returns `status: 0` (`STATUS_OK`) with a populated `reading`; an unknown tag returns `status: 1` (`STATUS_UNKNOWN_TAG`) and an explanatory `error_message`.
+
+## Launch arguments
+
+All five arguments forward straight to node parameters of the same name and into the underlying `GreenhouseSimulator` / sim-time config. Each sim-time arg has a **sentinel default that means "leave the upstream config alone"**, so launching with no arguments preserves whatever `mdp-greenhouse` loaded.
+
+| Arg | Default | Meaning |
+| --- | --- | --- |
+| `tag_file` | `''` | Path to a custom `tag_locations.json`. Empty → use `mdp-greenhouse`'s shipped tag file. |
+| `sim_config_file` | `''` | Path to a custom `greenhouse_config.yaml`. Empty → use the simulator's bundled config. |
+| `debug_time_of_day` | `-1.0` | Hours `0–24`. A value `>= 0.0` freezes sim time for deterministic tests and flips `debug_mode` on. |
+| `speedup_factor` | `0.0` | Sim seconds per real second. A value `> 0.0` overrides the config (the default config uses `1800`, a full 24 h cycle in 48 s). |
+| `debug_seed` | `-1` | RNG seed. A value `>= 0` flips `debug_mode` on, sets the sim seed, and re-seeds Python's `random`. |
+
+Setting `debug_time_of_day` or `debug_seed` automatically switches the simulator into deterministic `debug_mode`, which is what the contract tests rely on for repeatable, assertion-based checks on sensor noise.
+
+## Robustness to upstream bugs
+
+The bridge is built to survive the course simulator's rough edges:
+
+- **Version pin.** `setup.py` requires `mdp-greenhouse>=1.0.7`, the first release that fixes the `current_time()` hour-to-seconds conversion (debug and live), declares its own runtime deps (`pyyaml`, `numpy`, `matplotlib`, `fonttools`), and ships the `mdp-greenhouse` console script. Earlier versions had all three broken. Because `mdp-greenhouse` is not in rosdistro, the package carries a `python3-pip` `exec_depend` as the install path.
+- **`pathlib` wrap.** `mdp-greenhouse` 1.0.7's `TagManager` assigns the path argument directly to `self.file_path` and later calls `.exists()` on it, passing a raw `str` crashes with `AttributeError`. The node wraps `tag_file` / `sim_config_file` in `pathlib.Path` (or `None` when empty) before handing them over.
+- **Manual re-seed.** `GreenhouseSimulator` only seeds the RNG in its own `__init__`. After applying `debug_seed`, the node additionally calls `random.seed(debug_seed)` so deterministic mode is actually deterministic.
+
+<Callout type="warn">
+  If your readings look implausible (e.g. a frozen time-of-day you didn't ask for, or
+  non-reproducible noise under a fixed seed), check the installed `mdp-greenhouse`
+  version first. Anything below `1.0.7` reintroduces the bugs the bridge works around.
+</Callout>
+
+## Where it fits in the stack
+
+```text
+[mission node]                                  [Nav2 / mission planner]
+       │                                                   │
+       │ get_tag_reading(tag_id)                           │
+       ▼                                                   ▼
+[lupin_greenhouse_bridge] ────── (no shared state) ─── [robot pose]
+       │
+       ▼
+[GreenhouseSimulator]  (mdp-greenhouse, in-process Python)
+```
+
+The mission orchestrator calls the service once per confirmed tag; the returned `TagReading` flows on into the perception aggregator and the digital twin as a typed observation. The bridge itself holds no robot state and shares nothing with navigation.
+
+<Callout type="info">
+  The bridge and its message contracts are open-sourced separately as
+  **`lupin_greenhouse_ros`**, a standalone repo of the bridge plus `lupin_msgs` for
+  fellow students, independent of the team monorepo.
+</Callout>
+
+<Cards>
+  <Card title="Perception" href="/docs/perception">AprilTag detection that produces the real tag IDs this bridge keys on.</Card>
+  <Card title="Mission orchestrator" href="/docs/mission">The sole consumer, calls the service once per confirmed tag.</Card>
+  <Card title="Interfaces" href="/docs/interfaces">The full `lupin_msgs` schema, including `GetTagReading`, `TagReading`, and `SensorReading`.</Card>
+  <Card title="Digital twin" href="/docs/digital-twin">Where each reading lands as a typed observation.</Card>
+</Cards>

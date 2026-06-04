@@ -1,0 +1,24 @@
+{
+  "title": "Documentation",
+  "root": true,
+  "pages": [
+    "index",
+    "quickstart",
+    "architecture",
+    "hardware",
+    "---The stack---",
+    "navigation",
+    "mission",
+    "perception",
+    "digital-twin",
+    "greenhouse-bridge",
+    "web-hmi",
+    "teleop",
+    "---Reference---",
+    "interfaces",
+    "operations",
+    "networking",
+    "---Project---",
+    "demos"
+  ]
+}

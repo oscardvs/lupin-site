@@ -1,0 +1,65 @@
+---
+title: Demos
+description: Where the Lupin demo videos live, and how to add your own clips to the site.
+---
+
+The strongest thing a physical-robot project can show is the robot *moving*. This page,
+and the **See it move** section on the [home page](/), is where Lupin's demo footage
+goes. The slots are wired and waiting for clips.
+
+<Callout type="warn">
+  The demo videos are **placeholders** until real footage is dropped in. On the home page
+  the empty slots render a loud magenta placeholder naming the exact file to add, so an
+  unfilled demo can never be mistaken for finished work.
+</Callout>
+
+## Planned clips
+
+| Slot | File | What it should show |
+| --- | --- | --- |
+| Hero | `public/demos/hero.mp4` | A 10–20 s ambient loop: the robot navigating while the HMI map / twin update live. Autoplays muted on the landing page. |
+| Navigation (sim) | `public/demos/navigation.mp4` | Autonomous Nav2 navigation in the Gazebo greenhouse, a goal sent, a path planned and followed. |
+| Hardware run | `public/demos/hardware.mp4` | The real MIRTE Master driving an aisle and reading a tag. |
+| Twin + HMI | `public/demos/twin.mp4` | The web console: telemetry, the map, and the digital-twin heatmap filling in as tags are visited. |
+| Voice | `public/demos/voice.mp4` | A spoken command (“drive forward half a metre”, “go to table three”) executing through the voice agent. |
+
+## Adding a clip
+
+<Steps>
+
+<Step>
+Record the clip and export it as an `.mp4` (H.264). Keep ambient loops short (10–20 s,
+720p, a few MB); use a higher-quality file only for the one hero clip.
+</Step>
+
+<Step>
+Drop it into `public/demos/` with the filename from the table above. The home-page slot
+upgrades from the placeholder to a real player automatically, no code change needed.
+</Step>
+
+<Step>
+To embed a clip *inside a docs page*, use the `<Video>` component with a path under
+`/public`:
+
+```mdx
+<Video src="/demos/navigation.mp4" poster="/demos/navigation.jpg" />
+```
+
+Or embed a hosted clip from YouTube:
+
+```mdx
+<YouTube id="YOUR_VIDEO_ID" title="Lupin autonomous run" />
+```
+</Step>
+
+</Steps>
+
+<Callout type="info">
+  Always export a **poster frame** (`/demos/<name>.jpg`), it prevents layout shift, makes
+  the load feel instant, and is what shows in social-media link previews.
+</Callout>
+
+<Cards>
+  <Card title="Architecture" href="/docs/architecture">See what the footage is actually showing.</Card>
+  <Card title="Quickstart" href="/docs/quickstart">Run it yourself and record your own.</Card>
+</Cards>

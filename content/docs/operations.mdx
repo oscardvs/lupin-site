@@ -1,0 +1,350 @@
+---
+title: Operations & troubleshooting
+description: The Lupin operational runbook, the event-driven bring-up cascade, boot-time controller self-heal, SLAM map reset, and the failure modes that bite in practice.
+---
+
+This is the runbook for operating Lupin on the real MIRTE Master V2. It describes
+what the bring-up code actually does, the event-driven sentinel cascade, the
+boot-time controller self-heal, and the SLAM map-reset path, and then the
+failure modes worth knowing, each as **symptom → cause → fix**.
+
+The runtime is split across two machines: the **robot** runs three Lupin systemd
+units on top of the vendor `mirte-ros.service`, and the **laptop** brings up the
+HMI, SLAM, Nav2, the digital twin, and perception in a single
+`ros2 launch lupin_bringup hardware.launch.py`. See [Deploy & networking](/docs/networking)
+for the install steps and the laptop ↔ robot DDS setup.
+
+## The event-driven bring-up cascade
+
+`hardware.launch.py` does **not** sleep between stages. It chains tiny "wait for
+a topic" sentinel processes, each is a one-shot `ros2 topic echo --once` (or a
+TF lookup) that exits the moment its target appears, and uses
+`RegisterEventHandler(OnProcessExit)` to fire the next stage on that exit. The
+chain is:
+
+```text
+wait_for_scan  (/scan)              ──▶ slam_toolbox
+wait_for_map   (/map)               ──▶ wait_for_tf
+wait_for_tf    (odom→base_link)     ──▶ Nav2 lifecycle
+```
+
+Why event-driven and not delay-driven: a fixed `sleep` either wastes time on a
+fast boot or fires too early on a slow one, and when it fires too early the
+downstream stage fails *silently* under a flood of retry warnings. With
+sentinels, a stalled stage is immediately visible, the launch is simply parked
+on `wait_for_scan` or `wait_for_map`, which tells you exactly which dependency
+never came up.
+
+Each sentinel is gated by its own subsystem flag, so disabling one stage doesn't
+block the rest:
+
+- `wait_for_scan` echoes one `sensor_msgs/msg/LaserScan` on `/scan`, then starts
+  `slam_toolbox`. On hardware the robot's RPLidar is already publishing before
+  the laptop launches, so this usually clears instantly.
+- `wait_for_map` echoes `/map` (`nav_msgs/msg/OccupancyGrid`) **with RELIABLE +
+  TRANSIENT_LOCAL QoS**, the echo must match `slam_toolbox`'s QoS or the
+  subscription never connects and the cascade stalls forever.
+- `wait_for_tf` runs `ros2 run lupin_bringup wait_for_tf odom base_link 30.0`,
+  blocking until the `odom→base_link` transform resolves in the laptop's tf2
+  buffer (timeout 30 s).
+
+<Callout type="warn">
+  `wait_for_tf` exists because of a real hardware race. A cold DDS-over-WiFi
+  `/tf` subscription takes ~5–10 s to populate the buffer. Nav2's
+  `local_costmap` activation does a single `canTransform()` with a short retry
+  budget and bails with `Invalid frame ID base_link` if TF isn't hot yet,
+  leaving the lifecycle stuck. The sentinel gates Nav2 until the transform is
+  live. After it clears, expect roughly 15–30 s for the Nav2 lifecycle to reach
+  ACTIVE on a cold start.
+</Callout>
+
+The launch also self-sources `~/.config/lupin/ros-env.sh` into its own process
+before spawning anything, so every child (rosbridge, Nav2, RViz) inherits a
+consistent discovery-server env regardless of which terminal you launched from.
+It prints a clickable HMI URL banner with the auto-detected LAN IP; if the env
+was applied it also prints `[lupin_bringup] applied DDS env from …`.
+
+## Boot-time controller self-heal (`auto_home`)
+
+On the robot, `lupin-auto-home.service` runs the `auto_home` one-shot after
+`lupin-onboard.service`. Its first job is to **self-heal the ros2_control
+stack**, it closes the documented vendor first-boot spawner race before parking
+the arm.
+
+`auto_home` lists controllers via `/controller_manager/list_controllers` and
+drives five targets to `active`:
+
+- `joint_state_broadcaster`
+- `pid_wheels_controller`
+- `mirte_master_arm_controller`
+- `mirte_master_gripper_controller`
+- `mirte_base_controller`
+
+For each it picks the right repair based on the controller's reported state:
+`LoadController` if missing, `ConfigureController` if unconfigured,
+`SwitchController` (BEST_EFFORT) if merely inactive. It then waits up to 30 s for
+`/joint_states` (all four arm joints) and up to 30 s for `/lupin/arm/preset`,
+settles 2 s, and calls the preset service with `name='home'` so the arm parks in
+its measured low-gravity rest pose (avoiding the Hiwonder `shoulder_lift` thermal
+trip). Opt out with `LUPIN_AUTO_HOME=false` in `~/.mirte_settings.sh`.
+
+The unit is `Type=oneshot` with `RemainAfterExit=yes`, `Restart=on-failure`,
+`RestartSec=15`, capped at `StartLimitBurst=4`. If the discovery server fails to
+bind or `controller_manager` is slow, `auto_home` times out and exits non-zero;
+the retry gives a later attempt, by which point `mirte-ros` has settled, a
+chance to win. When controller state is genuinely *unverifiable*, `heal` returns
+`None` and the node exits **0** on purpose, so a wedged stack doesn't spin the
+restart loop forever.
+
+<Callout type="warn">
+  A failed `oneshot` stays `failed` and systemd does **not** auto-retry it on the
+  next boot, and never fires it at all on resume-from-suspend, where the boot ID
+  doesn't change. The operator re-trigger is `post-boot-sync.sh`, which runs
+  `systemctl reset-failed lupin-auto-home` then `systemctl start lupin-auto-home`
+  (both idempotent).
+</Callout>
+
+## SLAM map reset via process respawn
+
+The HMI "Erase map" button calls `/lupin/nav/clear_map`
+(`std_srvs/srv/Trigger`), served by `slam_reset_node`. There is no clean way to
+do this in slam_toolbox 2.6, `/slam_toolbox/clear_changes` only drops the
+localization edit buffer, not the scan-built occupancy grid. So the pragmatic v1
+**SIGTERMs the `slam_toolbox` process** and lets it come back empty.
+
+This only works because `hardware.launch.py` spawns slam_toolbox *directly*
+(not via `online_async_launch.py`) specifically so it can pin `respawn=True`
+(`respawn_delay=1.0`). The reset:
+
+1. Best-effort clears the Nav2 costmaps
+   (`/local_costmap/clear_entirely_local_costmap`,
+   `/global_costmap/clear_entirely_global_costmap`) so stale lethal cells don't
+   stay inflated under the robot while SLAM is down.
+2. `pgrep`/SIGTERMs every process matching `async_slam_toolbox_node` (catches
+   both async and sync mappers).
+3. The launch's `respawn=True` brings slam_toolbox back with an empty pose graph.
+   `/map` repopulates after roughly 5–10 s.
+
+If no matching process is found, the service returns `success=false` with a
+message saying slam_toolbox may not be running, a useful signal that you reset
+the wrong thing or SLAM was never up.
+
+## Failure modes
+
+### Controllers not active on boot (wheels/gripper dead, arm won't move)
+
+**Symptom.** After a cold boot, the chassis won't drive, the gripper doesn't
+respond, and `ros2 control list_controllers` shows fewer than 5 active,
+typically 3 controllers stuck `unconfigured` and the wheel + gripper controllers
+never loaded. The arm also never reached its home pose.
+
+**Cause.** The vendor `mirte-ros` controller-spawner race lost, and
+`lupin-auto-home` either timed out or is stuck `failed` from a previous boot /
+resume-from-suspend (systemd won't auto-retry a failed oneshot).
+
+**Fix.** Re-trigger the heal:
+
+```bash
+~/.config/lupin/post-boot-sync.sh
+```
+
+It runs `systemctl reset-failed lupin-auto-home && systemctl start lupin-auto-home`
+on the robot, then prints `ros2 control list_controllers` so you can confirm 5
+active. (The `rcl node's context is invalid` line that sometimes prints is a
+ros2cli quirk, not a controller failure.)
+
+<Callout type="warn">
+  Do **not** `systemctl restart mirte-ros` after a vendor apt upgrade, that
+  trips the controller fragility and the wheels go dead. A cold power-cycle is
+  the only clean reload after an upgrade.
+</Callout>
+
+### HMI shows "LIVE" but every panel is blank
+
+**Symptom.** The HMI loads, the rosbridge pill is green / "LIVE", but battery,
+IMU, lidar, and telemetry are all empty, and you can't drive. `ssh` and `ping`
+to the robot work fine.
+
+**Cause.** The laptop's rosbridge can't subscribe to anything over DDS. The most
+common reason is that ROS 2's default FastDDS uses UDP multicast for discovery,
+which the WiFi AP silently drops, so `ros2 topic list` from the laptop returns
+only `/parameter_events` and `/rosout`.
+
+**Fix.** Run the laptop DDS setup once and relaunch from a fresh shell
+(`setup-laptop-dds-env.sh`). Full procedure in [Deploy & networking](/docs/networking).
+Quick confirmation:
+
+```bash
+ros2 daemon start && sleep 5
+ros2 topic list | wc -l                          # expect 50+, not 2
+```
+
+### HMI blank, but a fresh terminal *does* see robot topics
+
+**Symptom.** The HMI is blank, yet `ros2 topic list` in a brand-new terminal
+shows all the robot topics.
+
+**Cause.** The DDS env is per-process. The HMI's rosbridge was launched from a
+terminal that never sourced `ros-env.sh`, so only *it* is on multicast while your
+new shell is on the discovery server. (`hardware.launch.py` self-sources the env
+to prevent exactly this, but a stale rosbridge from another launch can still be
+on the wrong config.)
+
+**Fix.** Confirm, then relaunch the HMI from a fresh shell:
+
+```bash
+tr '\0' '\n' </proc/$(pgrep -f rosbridge_websocket)/environ | grep ROS_DISCOVERY_SERVER
+# empty output confirms the rosbridge is on multicast
+```
+
+The `lupin_web` launch prints a `rosbridge DDS mode:` banner to catch this early.
+
+### Battery was live, then died after a launch Ctrl-C
+
+**Symptom.** Telemetry worked, you Ctrl-C'd a launch, and now panels are blank
+again.
+
+**Cause.** Zombie ROS processes from the killed launch keep binding DDS ports
+(7410–7447) and hijack discovery responses, the discovery server hands topic
+info to the zombie and your fresh participant gets nothing.
+
+**Fix.** Sweep the stragglers before relaunching:
+
+```bash
+pgrep -af 'robot_state_pub|rosbridge_websocket|rviz2|twin_node|tag_annotator|wait_for' \
+  | grep -v grep
+# kill -9 any PIDs that show up, then relaunch
+```
+
+### `ros2 topic list` returns 2 even with the right DDS env
+
+**Symptom.** Setup ran, you opened a fresh shell, and the topic count is still 2
+(or it was 50+ and dropped to 2 after switching WiFi).
+
+**Cause(s).** Either the daemon raced discovery, the network changed under a
+stale daemon config, stale shared-memory segments are wedging new participants,
+or the robot's discovery server isn't actually listening.
+
+**Fixes, in order.**
+
+1. **Daemon raced discovery.** `ros2 topic list` auto-starts the daemon but
+   doesn't wait for it to finish discovering. Run `ros2 daemon start && sleep 5`
+   first, then list.
+2. **Network changed.** Re-run `setup-laptop-dds-env.sh <new-robot-ip>` and open
+   a fresh shell. The robot side never changes, its participants always point at
+   `127.0.0.1:11811`.
+3. **Stale SHM after a hard kill.** A `kill -9` / Ctrl-C wedge can leave stale
+   `/dev/shm/fastrtps_*` segments that silently break fresh participants. Wipe
+   them before relaunching:
+
+   ```bash
+   rm -f /dev/shm/fastrtps_*
+   ```
+4. **Server not listening.** SSH in and check the port; if empty, `MIRTE_FASTDDS`
+   wasn't picked up:
+
+   ```bash
+   sudo ss -lnup | grep 11811   # expect fast-discovery-server on 0.0.0.0:11811
+   ```
+
+<Callout type="info">
+  Don't thrash `ros2 daemon stop/start` repeatedly, bouncing it poisons the
+  discovery cache. If the robot stack itself looks wrong, restart
+  `mirte-ros.service` instead.
+</Callout>
+
+### Clock skew wedges `controller_manager`
+
+**Symptom.** The controller stack behaves erratically and won't recover; the
+robot booted with an obviously wrong clock (the Orange Pi 3B has no RTC, and in
+AP mode there's no NTP source, so it boots with whatever time it had at
+shutdown).
+
+**Cause.** Time discontinuity confuses ros2_control's timing.
+
+**Fix.** Sync the clock **before** the ROS stack is doing real work, via
+`post-boot-sync.sh` (which `ssh`es `sudo date -s @<laptop-utc>` to the robot and
+checks drift is 0–1 s):
+
+```bash
+~/.config/lupin/post-boot-sync.sh
+```
+
+<Callout type="error">
+  Do **not** run `date -s` on a *live* stack, stepping the clock under a running
+  `ros2_control` wedges it, and only a power-cycle clears it. Sync first, launch
+  second.
+</Callout>
+
+### Cameras won't come up / `lupin-cameras` fails to open a device
+
+**Symptom.** `lupin-cameras.service` restarts in a loop or its launch errors out
+opening `/dev/video*`.
+
+**Cause.** `lupin-cameras` kills the vendor camera nodes via `ExecStartPre`
+(`kill-vendor-cameras.sh`) so the V4L/USB handles are free, then relaunches at
+config-driven low FPS on the same vendor topic names. If a camera process is
+hung in D-state, the device handle isn't released in time.
+
+**Fix.** The kill script already SIGTERMs, drains, then SIGKILLs stragglers, and
+`Restart=on-failure` lets `ExecStartPre` run again on the next attempt. If it
+stays stuck, restart the unit so the cleanup re-runs:
+
+```bash
+sudo systemctl restart lupin-cameras
+```
+
+A related quirk: the gripper-cam `usb_cam` lazy-publishes and destroys its
+publisher when nothing is subscribed. After long stops, restarting
+`lupin-cameras` is the reliable way to wake it.
+
+### Mission orchestrator goes FAULT on a cold start
+
+**Symptom.** With `mission:=true`, the orchestrator transitions to FAULT shortly
+after launch.
+
+**Cause.** Nav2 lifecycle activation in slam mode takes longer than the
+orchestrator's default dependency wait on a cold start.
+
+**Fix.** The bring-up already raises `dependency_timeout_s` to `120.0` (up from
+the 30 s default). If your start is unusually slow, bump it further:
+
+```bash
+ros2 launch lupin_bringup hardware.launch.py mission:=true dependency_timeout_s:=180.0
+```
+
+## Routine boot sequence
+
+<Steps>
+  <Step>
+    Power on the robot. Cold-boot load average of 8–12 for the first 60–90 s is
+    normal (device init I/O, not a fault); SSH may briefly drop.
+  </Step>
+  <Step>
+    Once the robot has settled (~90 s), run `~/.config/lupin/post-boot-sync.sh`
+    from the laptop. It syncs the clock, checks the discovery server and the
+    `mirte-ros` / `lupin-onboard` / `lupin-cameras` units, re-triggers
+    `lupin-auto-home`, and lists controllers (expect 5 active).
+  </Step>
+  <Step>
+    From a shell that has sourced the DDS env, launch the laptop stack:
+
+    ```bash
+    ros2 launch lupin_bringup hardware.launch.py
+    ```
+  </Step>
+  <Step>
+    Open `https://<laptop-ip>:8090` (the launch banner prints the clickable URL)
+    once Vite logs "ready in NNN ms". Accept the self-signed cert once per
+    device; the rosbridge pill goes green within a couple of seconds.
+  </Step>
+</Steps>
+
+## See also
+
+<Cards>
+  <Card title="Deploy & networking" href="/docs/networking">systemd units and the laptop ↔ robot FastDDS-over-WiFi setup.</Card>
+  <Card title="Navigation" href="/docs/navigation">Nav2 for the mecanum base, SLAM mode, costmaps, the controller.</Card>
+  <Card title="Web HMI & voice" href="/docs/web-hmi">The browser mission console that consumes this stack.</Card>
+  <Card title="Teleop & manual control" href="/docs/teleop">The command-arbitration bus and the onboard control surfaces.</Card>
+</Cards>

@@ -1,0 +1,232 @@
+---
+title: Quickstart
+description: Clone, build, and bring up Lupin end-to-end, one command in Gazebo, one against the real MIRTE Master, then start your first mission.
+---
+
+This page takes you from a fresh clone to a running robot: prerequisites, build, the one-command bring-up, and the first mission. Lupin runs the *same code* in Gazebo and on the real MIRTE Master V2, only the branch and a single launch differ.
+
+## Prerequisites
+
+Lupin is one ROS 2 package set that drops into a workspace alongside the **MIRTE vendor stack**, that shared infrastructure must be in place first. The robot README is the authoritative install guide; the essentials are:
+
+1. **Ubuntu 22.04** (native or dual-boot, *not* WSL).
+2. **ROS 2 Humble** (`ros-humble-desktop`), with `source /opt/ros/humble/setup.bash` in your `~/.bashrc`.
+3. A **colcon top-level workspace**, `~/ros2_ws/src` plus a `.colcon_root` marker and the [`colcon-top-level-workspace`](https://github.com/rhaschke/colcon-top-level-workspace) extension.
+4. The **MIRTE Master vendor packages**, pulled into `~/ros2_ws/src` via `vcstool` and the `mirte.repos` manifest. See the [MIRTE developer docs](https://docs.mirte.org/develop/index.html).
+5. The **`mdp-greenhouse`** environmental simulator (course-provided, on [PyPI](https://pypi.org/project/mdp-greenhouse/)), this is the actual sensing modality, queried at AprilTag locations through a Python API, not a Gazebo plugin.
+
+<Callout type="warn">
+  `mdp-greenhouse` ships with packaging gotchas: the wheel declares no runtime
+  deps and registers no console script. Install the deps it forgets and invoke
+  it as a module:
+
+  ```bash
+  sudo apt install python3-tk
+  pip install mdp-greenhouse pyyaml matplotlib numpy
+  python -m greenhouse_sim.cli --read --list-tags   # smoke test
+  ```
+
+  Full rationale lives in the robot `README.md` and on the
+  [greenhouse bridge](/docs/greenhouse-bridge) page.
+</Callout>
+
+## Clone and pick a branch
+
+Clone Lupin as a **sibling** of the vendor packages, never inside one of them. The repository uses three long-lived branches; check out the one that matches your target.
+
+<Tabs items={['Simulation','Hardware']}>
+<Tab value='Simulation'>
+
+```bash
+cd ~/ros2_ws/src
+git clone <lupin-repo-url> lupin
+cd lupin
+git checkout sim          # Gazebo bring-up, sim params, custom worlds
+```
+
+</Tab>
+<Tab value='Hardware'>
+
+```bash
+cd ~/ros2_ws/src
+git clone <lupin-repo-url> lupin
+cd lupin
+git checkout hardware     # real-robot bring-up, calibrated params
+```
+
+</Tab>
+</Tabs>
+
+`main` holds code that is identical regardless of deployment target (messages, perception, planning, HMI logic); `sim` and `hardware` add their target-specific bring-up on top. This documentation site tracks the `hardware` branch.
+
+## Build
+
+After cloning, rebuild the workspace so the `lupin_*` packages are indexed alongside the vendor stack:
+
+```bash
+cd ~/ros2_ws
+rosdep install --from-paths src -y --ignore-src
+colcon build --symlink-install
+source install/setup.bash
+```
+
+Add the `source ~/ros2_ws/install/setup.bash` line to your `~/.bashrc` so every shell sees the workspace. `--symlink-install` means edits to Python sources and configs take effect without a rebuild.
+
+<Callout type="info">
+  On **hardware**, the web HMI needs its Vite build artefact present. Build it
+  once before the first bring-up:
+
+  ```bash
+  cd ~/ros2_ws/src/lupin/lupin_web/web && npm install && npm run build
+  cd ~/ros2_ws && colcon build --symlink-install
+  ```
+</Callout>
+
+## One-command bring-up
+
+Top-level launches live in `lupin_bringup`. There is one entry point per target. Each composes the whole stack and prints a clickable **HMI URL banner** at the top of the log.
+
+<Tabs items={['Simulation','Hardware']}>
+<Tab value='Simulation'>
+
+```bash
+ros2 launch lupin_bringup sim_full.launch.py
+```
+
+`sim_full.launch.py` composes the entire simulation mission stack in one shot: Gazebo + the MIRTE in the generated greenhouse world, the greenhouse sensor bridge, the mission orchestrator, `lupin_twin`, `rosbridge_websocket` on `:9090`, the Lupin web HMI on `:8090`, `seed_amcl_pose`, a draining `sim_battery_publisher`, `twist_mux`, Xbox teleop, the arm sim shim, and RViz.
+
+The chain is **event-driven, not delay-driven**: `slam_toolbox` starts only once `/scan` first publishes, and Nav2 (in slam mode) starts only once `/map` first publishes. A stalled stage is therefore visible as "the next stage never fired" rather than buried under retry warnings.
+
+The banner prints `http://localhost:8090` and `http://<lan-ip>:8090` for the HMI.
+
+</Tab>
+<Tab value='Hardware'>
+
+```bash
+ros2 launch lupin_bringup hardware.launch.py mission:=true
+```
+
+`hardware.launch.py` is the **laptop-side** entry point. It runs on the operator's laptop on top of the robot's onboard systemd services (`mirte-ros`, `lupin-onboard`, `lupin-cameras`) and talks to the real MIRTE over the network. It brings up the Lupin web HMI (HTTPS `:8090` + `rosbridge_websocket` `:9090`), `slam_toolbox`, Nav2, `lupin_twin`, perception, the YOLO detector, and RViz; `mission:=true` adds the greenhouse bridge, mission orchestrator, and AMCL seed.
+
+It self-sources `~/.config/lupin/ros-env.sh` so every child process inherits the DDS-over-WiFi discovery-server env. The banner prints `https://<lan-ip>:8090` (self-signed cert, accept it once per device).
+
+<Callout type="warn">
+  Laptop ↔ robot over WiFi needs the FastDDS discovery-server setup done once
+  per laptop, or the HMI loads "LIVE" but every panel is blank. See
+  [Deploy & networking](/docs/networking).
+</Callout>
+
+</Tab>
+</Tabs>
+
+### Key launch arguments
+
+Each subsystem sits behind a boolean (or scalar) launch argument, so you can opt in or out without editing files. Override as `arg:=value` on the `ros2 launch` line.
+
+| Argument | Sim default | Hardware default | What it controls |
+| --- | --- | --- | --- |
+| `web` / `enable_web` | `true` | `true` | Web HMI + rosbridge. Set false for a headless smoke test. |
+| `slam` | (auto) | `true` | `slam_toolbox`, owns `/map` and the `map→odom` TF. |
+| `nav2` | (auto) | `true` | Nav2 stack in slam mode; waits for `/map` (and a hot `odom→base_link` TF on hardware) before activating. |
+| `twin` | (always) | `true` | `lupin_twin` aggregator → `/twin/state`. |
+| `mission` | (always) | `false` | Greenhouse bridge + orchestrator + AMCL seed bundle. Turn on for mission runs. |
+| `perception` | n/a | `true` | `tag_annotator` (AprilTag) + `perception_aggregator`. |
+| `yolo` | n/a | `true` | YOLO flower/anomaly detector (heavy; needs `ultralytics` + `numpy<2`). |
+| `rviz` | `true` | `true` | RViz with the persistent `full_bringup_viz.rviz` config. |
+| `joystick` | `true` | `true` | Xbox controller teleop. Set false on hosts without a pad, `joy_node` logs noisily otherwise. |
+| `seed_amcl` | `true` | (via `mission`) | Publishes a synthetic `/amcl_pose` to clear the orchestrator's `PREPARE.LOCALIZING` gate (slam mode has no AMCL). |
+| `dependency_timeout_s` | `120.0` | `120.0` | How long the orchestrator waits for Nav2 + bridge before going to `FAULT`. |
+
+In sim, `spawn_x` / `spawn_y` / `spawn_yaw` (`2.0` / `1.5` / `1.5708`) set the MIRTE's pose in the greenhouse world, the default puts it in the south aisle facing the tables. On hardware, `discovery_goal` (`5`) sets how many distinct tags an `ExplorationMission` discovers before switching to the monitoring loop.
+
+<Callout type="info">
+  Headless smoke test (no HMI, no RViz window) on either target:
+
+  ```bash
+  # sim
+  ros2 launch lupin_bringup sim_full.launch.py enable_web:=false rviz:=false
+  # hardware
+  ros2 launch lupin_bringup hardware.launch.py web:=false rviz:=false
+  ```
+</Callout>
+
+## Once it's up
+
+Wait for the chain to settle, Gazebo loaded (or the robot's `/scan` live), `mirte_base_controller` active, Nav2 lifecycle reporting `Managed nodes are active`, and the orchestrator printing `Dependencies up. Orchestrator READY.`
+
+<Steps>
+
+<Step>
+
+**Open the HMI** at the banner URL.
+
+- Simulation: `http://localhost:8090`
+- Hardware: `https://<laptop-ip>:8090` (accept the self-signed cert once)
+
+The rosbridge pill in the top bar goes green within a couple of seconds.
+
+</Step>
+
+<Step>
+
+**Drive a short loop.** Open the **Teleop** tab and nudge the robot around (left joystick = linear x/y, right = angular z). `slam_toolbox` needs a few scans of context before Nav2 will plan, its global costmap won't extend beyond the explored region.
+
+In **simulation only**, do a one-time per-browser setting first: gear icon → **Drive** → set the `cmd_vel topic` to `/cmd_vel_manual`. The sim's `twist_mux` arbitrates between Nav2 (`/cmd_vel_auto`) and manual override (`/cmd_vel_manual`); publishing straight to the controller topic bypasses the mux and races Nav2.
+
+</Step>
+
+<Step>
+
+**Start a mission.** Call `/mission/start` with a mission type and (for `InspectionMission`) a tag sequence:
+
+```bash
+ros2 service call /mission/start lupin_msgs/srv/StartMission \
+  "{mission_type: 'InspectionMission', tag_sequence: ['1','2']}"
+```
+
+The orchestrator transitions `READY → PREPARE` and replies with `accepted` and a `mission_id` (or an `error_message` on reject). For an `ExplorationMission`, `tag_sequence` is ignored, pass `mission_type: 'ExplorationMission'` and optionally a `discovery_goal`.
+
+<Callout type="info">
+  In sim, prefer tags near the spawn aisle (`['1','2']`) for your first
+  end-to-end run, the P3D plugin's pose drift accumulates over long runs.
+  See [Navigation](/docs/navigation).
+</Callout>
+
+</Step>
+
+<Step>
+
+**Watch progress.** `/mission/state` publishes a `MissionState` snapshot at a fixed 5 Hz whenever the orchestrator is alive, and every reading lands on `/floranova/observations`:
+
+```bash
+ros2 topic echo /mission/state lupin_msgs/msg/MissionState
+ros2 topic echo /floranova/observations lupin_msgs/msg/Observation
+```
+
+`MissionState` carries `lifecycle_state` (`BOOT`/`READY`/`PREPARE`/`EXPLORING`/`INSPECTING`/`MONITORING`/`RETURNING`/`DONE`/`FAULT`), `mission_phase`, the `targets_total`/`targets_completed`/`targets_failed` counts, and `estop_engaged` / `paused` flags.
+
+</Step>
+
+</Steps>
+
+### Operator controls
+
+These `std_srvs/srv/Trigger` services act on a running mission at any time:
+
+```bash
+ros2 service call /mission/pause         std_srvs/srv/Trigger
+ros2 service call /mission/resume        std_srvs/srv/Trigger
+ros2 service call /mission/abort         std_srvs/srv/Trigger
+ros2 service call /mission/skip_current  std_srvs/srv/Trigger
+```
+
+The web HMI's permanent E-STOP bar also preempts the mission. Releasing E-STOP clears `/e_stop_state`, but the mission stays paused until you call `/mission/resume`.
+
+## See also
+
+<Cards>
+  <Card title='Architecture' href='/docs/architecture'>The node/topic graph and the sim ↔ hardware boundary.</Card>
+  <Card title='Web HMI & voice' href='/docs/web-hmi'>The browser mission console on :8090 and its voice agent.</Card>
+  <Card title='Mission orchestrator' href='/docs/mission'>The state machine behind /mission/start and /mission/state.</Card>
+  <Card title='Operations' href='/docs/operations'>Bring-up order, failure modes, and recovery.</Card>
+</Cards>

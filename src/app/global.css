@@ -1,0 +1,257 @@
+@import 'tailwindcss';
+@import 'fumadocs-ui/css/neutral.css';
+@import 'fumadocs-ui/css/preset.css';
+
+@source '../../node_modules/fumadocs-ui/dist/**/*.js';
+
+/* ===========================================================================
+   Lupin, "Greenhouse Mission Console" design system.
+   Ported 1:1 from the live HMI (lupin_web/web/src/index.css): deep botanical
+   ink, lichen/chartreuse primary, signal-cyan + amber accents, Geist /
+   Instrument Serif / JetBrains Mono, hex-grid + reticle + scanline motifs.
+   Dark is the default canvas; a light theme mirrors the HMI's .light palette.
+   =========================================================================== */
+
+@theme {
+  --font-sans: var(--font-geist), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-serif: var(--font-instrument), 'Cormorant Garamond', ui-serif, Georgia, serif;
+
+  /* Brand palette as first-class Tailwind tokens (text-chartreuse, bg-signal, …).
+     These are the DARK defaults; :root (light) + .dark override the vars below. */
+  --color-chartreuse: hsl(78 90% 58%);
+  --color-signal: hsl(192 90% 60%);
+  --color-warning: hsl(38 95% 60%);
+  --color-danger: hsl(8 92% 55%);
+  --color-hairline: hsl(120 6% 18%);
+
+  --radius-fd: 0.25rem;
+}
+
+/* ---- Light theme (default class-less :root), mirrors the HMI .light block -- */
+:root {
+  color-scheme: light;
+
+  --color-fd-background: hsl(60 25% 97%);
+  --color-fd-foreground: hsl(120 30% 8%);
+  --color-fd-muted: hsl(60 20% 92%);
+  --color-fd-muted-foreground: hsl(120 8% 38%);
+  --color-fd-popover: hsl(0 0% 100%);
+  --color-fd-popover-foreground: hsl(120 30% 8%);
+  --color-fd-card: hsl(0 0% 100%);
+  --color-fd-card-foreground: hsl(120 30% 8%);
+  --color-fd-border: hsl(60 12% 84%);
+  --color-fd-ring: hsl(88 80% 32%);
+  --color-fd-primary: hsl(88 80% 32%);
+  --color-fd-primary-foreground: hsl(0 0% 100%);
+  --color-fd-secondary: hsl(60 20% 92%);
+  --color-fd-secondary-foreground: hsl(120 30% 8%);
+  --color-fd-accent: hsl(88 70% 88%);
+  --color-fd-accent-foreground: hsl(88 80% 22%);
+
+  /* Accent darkens on light so chartreuse text/links stay legible on a pale bg. */
+  --color-chartreuse: hsl(88 80% 30%);
+  --color-signal: hsl(195 80% 38%);
+  --color-warning: hsl(32 90% 45%);
+  --color-danger: hsl(8 80% 45%);
+  --color-hairline: hsl(60 10% 82%);
+
+  --fd-layout-width: 1440px;
+}
+
+/* ---- Dark theme, the signature mission-console ink (default brand look) ---- */
+.dark {
+  color-scheme: dark;
+
+  --color-fd-background: hsl(120 12% 5%);
+  --color-fd-foreground: hsl(60 18% 92%);
+  --color-fd-muted: hsl(120 8% 11%);
+  --color-fd-muted-foreground: hsl(80 10% 60%);
+  --color-fd-popover: hsl(120 12% 6%);
+  --color-fd-popover-foreground: hsl(60 18% 92%);
+  --color-fd-card: hsl(120 10% 7%);
+  --color-fd-card-foreground: hsl(60 18% 92%);
+  --color-fd-border: hsl(120 8% 14%);
+  --color-fd-ring: hsl(78 90% 58%);
+  --color-fd-primary: hsl(78 90% 58%);
+  --color-fd-primary-foreground: hsl(120 25% 6%);
+  --color-fd-secondary: hsl(120 8% 12%);
+  --color-fd-secondary-foreground: hsl(60 18% 92%);
+  --color-fd-accent: hsl(120 8% 12%);
+  --color-fd-accent-foreground: hsl(78 90% 75%);
+
+  --color-chartreuse: hsl(78 90% 58%);
+  --color-signal: hsl(192 90% 60%);
+  --color-warning: hsl(38 95% 60%);
+  --color-danger: hsl(8 92% 55%);
+  --color-hairline: hsl(120 6% 18%);
+}
+
+html {
+  scrollbar-gutter: stable;
+  font-feature-settings: 'ss01', 'cv01', 'cv11';
+}
+
+html > body[data-scroll-locked] {
+  margin-right: 0px !important;
+  --removed-body-scroll-bar-size: 0px !important;
+}
+
+body {
+  background-color: var(--color-fd-background);
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ---- Display + label type --------------------------------------------- */
+@layer components {
+  .font-display {
+    font-family: var(--font-serif);
+    font-style: italic;
+    letter-spacing: 0.04em;
+  }
+
+  /* Tiny tracked uppercase label, the cockpit's instrument tag. */
+  .tag {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    line-height: 1;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--color-fd-muted-foreground);
+  }
+  .tag-strong {
+    color: var(--color-fd-foreground);
+  }
+  .tag-accent {
+    color: var(--color-chartreuse);
+  }
+
+  /* Telemetry number ticker. */
+  .ticker {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-weight: 500;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .border-hairline {
+    border-color: var(--color-hairline);
+  }
+  .bg-hairline {
+    background-color: var(--color-hairline);
+  }
+
+  /* Hex-grid texture, optionally masked. Drop on a fixed/absolute layer.
+     Grid-line colour is theme-aware so it stays subtle on both canvases. */
+  .bg-grid {
+    background-image:
+      linear-gradient(color-mix(in srgb, var(--color-fd-foreground) 9%, transparent) 1px, transparent 1px),
+      linear-gradient(90deg, color-mix(in srgb, var(--color-fd-foreground) 9%, transparent) 1px, transparent 1px);
+    background-size: 56px 56px;
+    background-position: -1px -1px;
+  }
+  .bg-grid-fine {
+    background-image:
+      linear-gradient(color-mix(in srgb, var(--color-fd-foreground) 7%, transparent) 1px, transparent 1px),
+      linear-gradient(90deg, color-mix(in srgb, var(--color-fd-foreground) 7%, transparent) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }
+
+  /* Reticle / L-bracket corners, pure CSS, dropped on any positioned panel. */
+  .reticle {
+    position: relative;
+  }
+  .reticle::before,
+  .reticle::after,
+  .reticle > .reticle-bl,
+  .reticle > .reticle-br {
+    content: '';
+    position: absolute;
+    width: 10px;
+    height: 10px;
+    border-color: color-mix(in srgb, var(--color-chartreuse) 70%, transparent);
+    border-style: solid;
+    pointer-events: none;
+  }
+  .reticle::before { top: -1px; left: -1px; border-width: 1px 0 0 1px; }
+  .reticle::after { top: -1px; right: -1px; border-width: 1px 1px 0 0; }
+  .reticle > .reticle-bl { bottom: -1px; left: -1px; border-width: 0 0 1px 1px; }
+  .reticle > .reticle-br { bottom: -1px; right: -1px; border-width: 0 1px 1px 0; }
+
+  /* Soft glow on active primary surfaces. */
+  .glow-primary {
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--color-chartreuse) 35%, transparent),
+      0 0 32px -8px color-mix(in srgb, var(--color-chartreuse) 45%, transparent);
+  }
+
+  /* Scan-line that pulses across a panel. */
+  .scanline { position: relative; overflow: hidden; }
+  .scanline::after {
+    content: '';
+    position: absolute;
+    left: 0; right: 0; top: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent 0%, color-mix(in srgb, var(--color-chartreuse) 55%, transparent) 50%, transparent 100%);
+    animation: lupin-scan-y 6s linear infinite;
+    pointer-events: none;
+  }
+  @keyframes lupin-scan-y {
+    0%   { transform: translateY(0); opacity: 0; }
+    10%  { opacity: 0.9; }
+    90%  { opacity: 0.9; }
+    100% { transform: translateY(100%); opacity: 0; }
+  }
+
+  @keyframes lupin-spin-slow {
+    to { transform: rotate(360deg); }
+  }
+  .animate-spin-slow {
+    animation: lupin-spin-slow 18s linear infinite;
+  }
+
+  @keyframes lupin-fade-up {
+    from { opacity: 0; transform: translateY(16px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Animated mesh-gradient aurora, the marketing-page echo of the HMI's WebGL
+     backdrop, done in pure CSS (no second GL context on a content page). Soft
+     chartreuse↔cyan blooms drift on a slow loop. */
+  .aurora-anim {
+    background-image:
+      radial-gradient(55% 55% at 18% 28%, color-mix(in srgb, var(--color-chartreuse) 16%, transparent), transparent 62%),
+      radial-gradient(50% 50% at 82% 18%, color-mix(in srgb, var(--color-signal) 12%, transparent), transparent 62%),
+      radial-gradient(60% 60% at 60% 92%, color-mix(in srgb, var(--color-chartreuse) 8%, transparent), transparent 66%);
+    background-size: 180% 180%, 180% 180%, 180% 180%;
+    animation: lupin-aurora-drift 28s ease-in-out infinite;
+  }
+  @keyframes lupin-aurora-drift {
+    0%, 100% { background-position: 0% 50%, 100% 50%, 50% 100%; }
+    50%      { background-position: 100% 50%, 0% 50%, 50% 0%; }
+  }
+}
+
+/* Respect reduced motion across the whole site, freeze loops + long transitions. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Headings on docs pages use the serif display face for a cockpit feel,
+   while body stays Geist for readability. */
+#nd-docs-layout h1,
+.prose h1 {
+  letter-spacing: -0.01em;
+}

@@ -1,0 +1,149 @@
+---
+title: Digital twin
+description: A bridge-agnostic ROS 2 node that aggregates per-tag observations into a latched world snapshot and an on-demand inverse-distance-weighted sensor heatmap.
+---
+
+The digital twin is the layer that turns Lupin's stream of per-tag observations into a single queryable model of the greenhouse. It is one rclpy node, `lupin_twin`, sitting over two pure-Python modules, a per-tag observation store (`lupin_twin/state.py`) and an inverse-distance-weighted field reconstruction (`lupin_twin/idw.py`), and it exposes exactly two read-only contracts to everything downstream.
+
+## Bridge-agnostic by design
+
+The twin consumes **only** `/floranova/observations`. It has no dependency on Nav2, Gazebo, or the perception pipeline; it starts immediately and waits for observations to arrive. Whether the [mission orchestrator](/docs/mission) filled that stream from the `mdp-greenhouse` sensor simulator or from real perception plus on-board sensor modules is invisible here.
+
+That is the whole point: **the same node code runs in simulation and on hardware with no change.** Swapping the [greenhouse bridge](/docs/greenhouse-bridge) is a bridge-implementation concern, never a twin-contract change.
+
+```text
+                          /floranova/observations
+   orchestrator ────────────────────────────────────▶  lupin_twin
+   (sim OR hardware)        (Observation envelope)        │
+                                                          ├──▶ /twin/state      (latched, 1 Hz)
+                                                          └──▶ /twin/get_field  (IDW service)
+                                                                      │
+                                                                      ▼
+                                                            web HMI (pure consumer)
+```
+
+The node runs on a `SingleThreadedExecutor` with one `MutuallyExclusiveCallbackGroup` shared by the subscription, the service, and the publish timer. The store and the field cache are not thread-safe by design, serialisation happens at the executor layer, so no locking is needed.
+
+## ROS interfaces
+
+| Direction | Name | Type | Notes |
+|---|---|---|---|
+| Subscribe | `/floranova/observations` | `lupin_msgs/Observation` | RELIABLE + TRANSIENT_LOCAL, depth 50, a late-joining twin still receives the orchestrator's latched backlog. Frame-checked against the `frame_id` param. |
+| Publish | `/twin/state` | `lupin_msgs/TwinState` | RELIABLE + TRANSIENT_LOCAL, depth 1 (latched), at `state_publish_rate_hz` (default 1 Hz). Empty `tags` is the legitimate startup state. |
+| Service | `/twin/get_field` | `lupin_msgs/srv/GetField` | On-demand IDW field. Memoised by `(sensor, observation_count, bbox, resolution)` with a 64-entry LRU bound. Cells beyond `idw_max_distance_m` from any sample are encoded as `NaN`. |
+
+<Callout type="warn">
+  Both published interfaces are TRANSIENT_LOCAL. A native ROS 2 subscriber that defaults to VOLATILE, e.g. `ros2 topic echo /twin/state` without `--qos-durability transient_local`, gets nothing on first connect and only sees future updates at the publish rate. The HMI consumes via `rosbridge_websocket`, which hides this wrinkle, so it only bites CLI debugging.
+</Callout>
+
+## Contract 1, the latched `/twin/state` snapshot
+
+`_publish_state` walks every tag in the store and emits a `TwinState` (a `std_msgs/Header` plus a `TwinTagState[] tags` array). One `TwinTagState` per observed tag carries:
+
+- `string tag_id`
+- `geometry_msgs/Pose pose`, the map-frame tag pose. **`orientation.w == 0` means "never observed"**, and the HMI places no pin in that case.
+- `SensorReading[] readings`, the latest reading per sensor `name`/`value`.
+- `builtin_interfaces/Time last_observed`, the durable absolute timestamp of the most recent observation, the field off-line consumers should treat as the source of truth.
+- `float32 stale_seconds`, a publish-time `(now − last_observed)` convenience for the HMI's staleness fade.
+- `string species`, `float32 species_confidence`, `bool anomaly`, flower classification co-located with the tag (see below).
+
+Because the snapshot is latched at depth 1, a freshly-connected HMI sees the current world immediately, with no bootstrap round-trip.
+
+## Contract 2, the on-demand `/twin/get_field` IDW service
+
+`GetField` reconstructs a sensor heatmap over a map-frame 2D bounding box. The request carries `sensor_type` (one of `temperature`, `humidity`, `co2`, `light`, `soil_moisture`), a `resolution` (cell size in metres), and `bbox_min_x` / `bbox_min_y` / `bbox_max_x` / `bbox_max_y`. The response carries `ok`, `error_message`, a row-major `float32[] values` grid (`width × height`, `NaN` for cells with no nearby data), `width`, `height`, `origin_x`, `origin_y`, `resolution_used`, `value_min` / `value_max` (over non-NaN cells only; both `0` if all NaN), and `sample_count`.
+
+`_handle_get_field` rejects an empty `sensor_type`, a non-positive `resolution`, and an inverted bbox with `ok = false`.
+
+### The interpolation
+
+Each grid cell `c` evaluates to:
+
+```text
+field(c) = sum_i (w_i * v_i) / sum_i w_i        w_i = 1 / d_i ^ power
+```
+
+where the sum runs over observed tags within `idw_falloff_radius_m` of the cell, and `d_i` is the Euclidean distance from the cell centre to tag `i`. `power` defaults to `2.0`, the textbook IDW exponent, giving a soft, visually pleasant gradient. Lower is too smooth; `4+` becomes Voronoi-like.
+
+### Three correctness guards
+
+These are the details that keep the heatmap honest and stable, and each is backed by unit tests in `test/test_idw.py`.
+
+1. **Honesty gate (`NaN` beyond max distance).** If the *nearest* tag to a cell is farther than `idw_max_distance_m` (default `1.5 m`), the cell is left `NaN`. The HMI renders `NaN` as transparent, so unexplored greenhouse keeps the colour of the SLAM map underneath, Lupin paints colour **only where the data supports it**.
+
+2. **Coincident-cell pin (1 mm).** Cells closer than `COINCIDENT_EPS_M` (`1e-3 m`) to a tag are pinned to that tag's exact value rather than dividing by ≈0 in the weighted sum. Operators expect the heatmap *at* a tag location to read exactly that tag's reading.
+
+3. **No donut.** `idw_falloff_radius_m` and `idw_max_distance_m` default **equal** (both `1.5 m`). If they differ, falloff < max-distance, a cell in the gap passes the honesty gate but finds no neighbours within falloff, falls through to the nearest-value branch, and produces a hard "constant ring" around isolated samples. The equal default avoids that artifact; operators can still set them apart deliberately.
+
+```yaml
+lupin_twin:
+  ros__parameters:
+    idw_power: 2.0
+    idw_falloff_radius_m: 1.5
+    idw_max_distance_m: 1.5
+```
+
+<Callout type="info">
+  Why IDW and not Kriging or a Gaussian process? Sample sizes are small (≤ 30 tags) and the latency budget is tight (sub-100 ms for a 200×200 grid). IDW is a poor interpolator for *prediction* but a fine one for *visualisation*, and visualisation is the brief.
+</Callout>
+
+### Free repeat queries, the LRU cache
+
+Field results are memoised in a bounded `OrderedDict` LRU (cap `64`, `_FIELD_CACHE_CAP` in `node.py`) keyed by `(sensor, observation_count, resolution, bbox)`. Because the store's monotonically-increasing `observation_count` is part of the key, **cache invalidation is a single integer comparison**: any new observation bumps the count, so the next request misses and recomputes naturally, no eager cache clearing. Repeat queries against an unchanged world are free.
+
+Both cache hits and fresh computes copy a frozen `_CachedField` into a new per-call response, so rclpy's per-call `GetField.Response` object is never aliased across calls.
+
+## How observations land in the store
+
+`_on_observation` routes each `Observation` by `kind`:
+
+- **`KIND_TAG_READING`** is recorded. The message is frame-checked against the `frame_id` param, an observation in the wrong frame (e.g. an orchestrator accidentally publishing in `/odom`) is **dropped with a loud warning** rather than placed at a meaningless map coordinate. Sensor readings are copied into the tag's `latest_readings`.
+- **`KIND_FLOWER`** is merged onto the co-located tag (see below).
+- **`KIND_ANOMALY`** and any other kind are silently dropped, the pest flag rides the flower path instead.
+
+### Pose stability over AMCL drift
+
+Each tag's map pose is cached from the **first** OK observation that supplies one, and never re-stamped on later visits. Tags do not move, so re-stamping each visit would only inject AMCL localisation jitter into the HMI's tag marker. This deliberately trades staleness for stability.
+
+### `NaN`/`inf` filtering at the store boundary
+
+`samples_for_sensor()` returns `(x, y, value)` tuples only for tags that have both a pose **and** a finite reading for the requested sensor. Non-finite values, a sensor stub returning `float('nan')`, a divide-by-zero in a future bridge, are filtered out here, *before* the IDW math ever sees them. This matters because a single `NaN` in a weighted-sum numerator would poison every cell within the falloff radius and never recover.
+
+### Flower classification (`KIND_FLOWER`)
+
+The [perception aggregator](/docs/perception) co-locates the YOLO tulip class with each AprilTag and publishes a `KIND_FLOWER` observation on the same `/floranova/observations` topic. `_ingest_flower` merges `species`, `species_confidence`, and the `anomaly` (the `bug` pest) flag onto the tag's buffer, keyed by `flower.tag_id`, with **latest-wins** semantics, so a clean re-scan clears a prior pest flag. If the sensor-reading path has not already pinned the tag, the flower's own pose pins it.
+
+The twin stays a pure data plane: it carries `species` / `species_confidence` / `anomaly` out on each `TwinTagState`, but **health thresholds stay HMI-side**. The [web HMI](/docs/web-hmi) is a pure consumer of these two contracts, it derives flower health from the sensor readings itself and renders species, health, and the pest flag on the map and the Greenhouse State table.
+
+## Running it standalone
+
+`twin.launch.py` brings up the node alone (executable `twin_node`, node name `lupin_twin`). It assumes the orchestrator is already publishing observations; normally it is composed from a sim or hardware bring-up.
+
+<Tabs items={['Simulation','Hardware']}>
+<Tab value='Simulation'>
+
+```bash
+ros2 launch lupin_twin twin.launch.py
+ros2 service call /twin/get_field lupin_msgs/srv/GetField \
+  "{sensor_type: temperature, resolution: 0.1, bbox_min_x: 0.0, bbox_min_y: 0.0, bbox_max_x: 5.0, bbox_max_y: 5.0}"
+```
+
+</Tab>
+<Tab value='Hardware'>
+
+```bash
+ros2 launch lupin_twin twin.launch.py frame_id:=map
+ros2 topic echo /twin/state --qos-durability transient_local
+```
+
+</Tab>
+</Tabs>
+
+## See also
+
+<Cards>
+  <Card title="Perception" href="/docs/perception">Where the AprilTag readings and KIND_FLOWER observations come from.</Card>
+  <Card title="Web HMI & voice" href="/docs/web-hmi">The pure consumer that renders the snapshot and the heatmap.</Card>
+  <Card title="Interfaces" href="/docs/interfaces">The full Observation, TwinState, and GetField contracts.</Card>
+  <Card title="Mission orchestrator" href="/docs/mission">The source of the /floranova/observations stream.</Card>
+</Cards>

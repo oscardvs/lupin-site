@@ -1,0 +1,185 @@
+---
+title: Teleop & manual control
+description: Gamepad and web manual control on a priority-arbitrated velocity bus, plus arm presets, the gripper command path, and boot-time auto-home.
+---
+
+Lupin's manual layer lets an operator drive the mecanum base and pose the 4-DOF arm, from an Xbox pad, a DualShock4, or the web HMI, while never fighting the autonomy stack for the same command stream. Three velocity sources share one chassis bus, arbitrated by priority and per-source timeout, so a held dead-man instantly preempts Nav2 and releasing it hands the bus straight back.
+
+The whole layer lives in `lupin_hmi` and the *same code runs in Gazebo and on the real Mirte*, only the downstream drive topic changes.
+
+## The command-arbitration bus
+
+Three nodes publish `geometry_msgs/Twist` velocity commands; one arbiter forwards exactly one to the base controller. On the real robot and in the full sim, that arbiter is [`twist_mux`](https://github.com/ros-teleop/twist_mux), configured in `lupin_hmi/config/twist_mux.yaml`.
+
+| Source topic | Producer | Priority | Timeout |
+| --- | --- | --- | --- |
+| `/cmd_vel_joy` | Xbox dead-man teleop (`teleop_twist_joy`) | 100 | 0.3 s |
+| `/cmd_vel_manual` | Web HMI joystick widget / DS4 teleop | 50 | 0.5 s |
+| `/cmd_vel_auto` | Nav2 `velocity_smoother` | 10 | 0.5 s |
+
+`twist_mux` forwards the highest-priority source that is *currently publishing*. When that source goes silent for its `timeout`, the next-highest source is allowed through. The timeouts are tuned to each producer's publish rate:
+
+- **joy 0.3 s**, humans expect a snappy release; covers a single dropped joy frame at 50 Hz without dropping out mid-drive.
+- **manual 0.5 s**, the web HMI sends roughly 10 Hz over rosbridge and needs a wider window.
+- **auto 0.5 s**, Nav2's `velocity_smoother` runs at 20 Hz.
+
+<Callout type="info">
+  The Xbox dead-man is what makes priority arbitration honest. `teleop_twist_joy` is launched with `enable_button=6` (LB), so `/cmd_vel_joy` goes **completely silent** the moment LB is released, the 0.3 s timeout then elapses and Nav2 (or the web) regains the bus. If the dead-man were dropped, `joy_node` would publish an unbroken stream of all-zero `Twist` messages and permanently pin priority 100, starving every lower source.
+</Callout>
+
+The `cmd_vel_out` of `twist_mux` is remapped in the bring-up launch to the correct downstream topic for the target (see the tabs below).
+
+### The 2-source variant
+
+`teleop.launch.py` (the standalone DS4 + sim teleop) uses a separate, custom node, `cmd_vel_mux` (`lupin_hmi/cmd_vel_mux.py`), that implements the same manual-takeover idea for just two sources. It subscribes `/cmd_vel_manual` and `/cmd_vel_auto`, passes manual messages straight through, and **drops** auto messages for `manual_takeover_seconds` (default `0.5`) after each manual message, giving the operator a takeover window without fighting Nav2.
+
+### Why the publisher is BEST_EFFORT
+
+Both the sim's vendor `twist_mux` and the real mecanum controller subscribe **BEST_EFFORT**. A RELIABLE publisher silently drops every message on the QoS mismatch, the symptom is idle wheels even though commands are being published. `cmd_vel_mux` therefore publishes its downstream `Twist` with `QoSProfile(depth=10, reliability=BEST_EFFORT)` (`cmd_vel_mux.py:51`), and the same applies to the `twist_mux` output.
+
+## Driving the base
+
+One launch graph, two targets. The only thing that changes is the downstream drive topic: the sim's `JointTrajectoryController`/vendor `twist_mux` subscribes `/mirte_base_controller/cmd_vel_unstamped`, while the real Mirte firmware subscribes `/mirte_base_controller/cmd_vel`.
+
+<Tabs items={['Simulation','Hardware']}>
+<Tab value='Simulation'>
+
+`teleop.launch.py` with `use_sim:=true` also brings up the vendor Gazebo world and targets the sim drive topic. Use `world:=navigation` (the KRR small house, which has walls) when you need a map for SLAM.
+
+```bash
+ros2 launch lupin_hmi teleop.launch.py use_sim:=true world:=navigation
+```
+
+</Tab>
+<Tab value='Hardware'>
+
+The Xbox stack is joystick-only, `twist_mux` arbitration is owned by the bring-up launch, so run `xbox_teleop.launch.py` alongside it. This brings up `joy_node`, `teleop_twist_joy` (publishing `/cmd_vel_joy`), and `arm_teleop`.
+
+```bash
+ros2 launch lupin_hmi xbox_teleop.launch.py
+```
+
+For a minimal joystick-only output (e.g. bench-testing a DS4 binding) with no mux and no arm, use `laptop_teleop.launch.py`.
+
+</Tab>
+</Tabs>
+
+### Xbox control layout
+
+The mapping was probed live against an Xbox Wireless Controller (`045e:0b13`) in Bluetooth mode, its BLE HID descriptor does **not** follow the SDL2 default layout, so the indices below are specific to this pad. Re-probe with `ros2 topic echo /joy --field buttons` if you swap controllers.
+
+```text
+Drive (hold LB = button 6, the dead-man):
+    Left stick      → translation (linear.x fwd/back, linear.y strafe)
+    Right stick X   → angular.yaw (turn in place)
+    RB (button 7)   → turbo (~3× linear, ~2× angular scale)
+
+Arm (LB released, modes are mutually exclusive by construction):
+    Y (4) / A (0)   → shoulder_lift ±
+    B (1) / X (3)   → shoulder_pan ±
+    D-pad ←/→       → wrist ±
+    D-pad ↑/↓       → elbow ±
+    RT (axis 4)     → gripper open
+    LT (axis 5)     → gripper close
+```
+
+Two de-confliction decisions are load-bearing:
+
+- **Shoulder pan/lift live on the face buttons, not the right stick.** The right stick used to be dual-use, chassis yaw with LB held, shoulder pan with LB released, and brushing it during an LB release flicked the arm. Face buttons are physically separate from any chassis input, so the two modes can never bleed into each other.
+- **The shoulder is also gated off whenever LB is held** (`arm_teleop` `shoulder_disable_button=6`), as a belt-and-braces "don't move the arm while driving" guard.
+
+`joy_node` runs with `deadzone: 0.15` and `autorepeat_rate: 20.0`. The 0.15 deadzone covers the Series X|S pad's resting BT-mode drift; the joy default of `0.05` was too tight and let stick drift × `scale_angular` spin the chassis in place while LB was held.
+
+<Callout type="warn">
+  `scale_linear`/`scale_angular` in `config/xbox_config.yaml` are **negative** (`-0.2` / `-0.7`, turbo `-0.6` / `-1.4`). This mirrors the HMI `polarityInvertHmi` flip on Mirte-247264, whose mecanum drive is wired with motor and encoder leads reversed in pairs, the vendor `cmd_vel` frame is rotated 180° about Z relative to the physical chassis. Without the sign flip, pushing the stick forward drives the robot backwards.
+</Callout>
+
+`joy_node` is launched with `respawn=True` so that, paired with the `lupin_bringup` udev rebind rule, powering the pad on after boot brings teleop back without a service restart.
+
+## Arm and gripper teleop
+
+`arm_teleop` (`lupin_hmi/arm_teleop.py`) drives the 4-DOF arm and the 1-DOF gripper directly from `/joy`. It is an open-loop integrator:
+
+- Each active tick advances a joint by `step_rad` (default `0.15`, Xbox launch `0.15`) at `update_rate_hz` (default `10.0` Hz, matching the vendor `controller_manager` tick).
+- Every joint is clamped to ±1.5707 rad (the URDF ±π/2 limit).
+- It **seeds the commanded pose from `/joint_states` before sending anything** and refuses to publish until all four arm joints have been observed.
+- On the idle→active edge it re-seeds a joint from live `/joint_states`, so a tap is one clean step rather than a jump from a gravity-sagged setpoint.
+- Every trajectory point carries a non-zero velocity (`joint_velocity`, default `1.0`, Xbox launch `2.0`) to bypass the Hiwonder Telemetrix "velocity 0.0" rejection.
+
+Arm motion is published as `trajectory_msgs/JointTrajectory` to `/mirte_master_arm_controller/joint_trajectory`. The gripper is driven by the Xbox triggers (`open_axis=4` RT, `close_axis=5` LT), clamped to the URDF `gripper_joint` range `[-0.20, 0.25]` rad, and sent as `control_msgs/action/GripperCommand` goals to `/mirte_master_gripper_controller/gripper_cmd`.
+
+### The gripper command path
+
+The HMI never calls the raw Hiwonder gripper service. The path is:
+
+```text
+HMI slider
+   → /lupin/gripper/set_angle_with_speed   (mirte_msgs/srv/SetServoAngleWithSpeed)
+   → gripper_action_bridge                 (maps HMI ±30° → URDF [-0.20, 0.25] rad)
+   → mirte_master_gripper_controller/gripper_cmd  (control_msgs/action/GripperCommand)
+```
+
+`gripper_action_bridge` (`lupin_hmi/gripper_action_bridge.py`, class `LupinArmCommandBridge`, node name kept as `gripper_action_bridge` for systemd/log compatibility) runs on **both** sim and hardware and also exposes the per-joint arm sliders:
+
+| Service | Type | Purpose |
+| --- | --- | --- |
+| `/lupin/arm/<joint>/set_angle_with_speed` | `mirte_msgs/srv/SetServoAngleWithSpeed` | HMI per-joint arm slider → 4-joint `JointTrajectory` (deg→rad, clamp ±π/2) |
+| `/lupin/gripper/set_angle_with_speed` | `mirte_msgs/srv/SetServoAngleWithSpeed` | HMI gripper slider (±30° → URDF range → `GripperCommand`) |
+| `/lupin/arm/init` | `std_srvs/srv/Trigger` | Drive the arm to URDF zero over 5 s |
+
+<Callout type="warn">
+  On the first `/joint_states` covering all four arm joints, the bridge publishes one **startup-pin** trajectory holding the *current* pose, so the `JointTrajectoryController`'s internal setpoint matches reality. Without it, the vendor hardware interface (`servo_moved_dead_band` 0.05 rad) re-asserts its stale near-zero command and snaps the arm back. Arm commands are dropped (`status=False`) until `/joint_states` has seeded all joints. The bridge runs on hardware under its own systemd unit, `lupin-gripper-bridge.service` (`Requires=mirte-ros.service`, `MemoryMax=128M`).
+</Callout>
+
+## Arm presets
+
+`arm_preset_server` (`lupin_hmi/arm_preset_server.py`) exposes `/lupin/arm/preset` (`lupin_msgs/srv/SetArmPreset`). A caller asks for a pose by name, `{name: 'home'}`, without knowing joint angles, and the node publishes a `JointTrajectory` to `/mirte_master_arm_controller/joint_trajectory` over `PRESET_TRAVEL_SECONDS = 3.0` s. The same output topic works on the sim's Gazebo JTC and the real Hiwonder serial-bus JTC with no branching.
+
+Five static presets, in joint order `shoulder_pan` / `shoulder_lift` / `elbow` / `wrist` (radians):
+
+| Preset | Pose (rad) | Use |
+| --- | --- | --- |
+| `home` | `(0.04, -0.01, 0.01, -1.57)` | Measured minimum-gravity-load rest pose; the auto-home target |
+| `zero` | `(0, 0, 0, 0)` | The literal URDF zero pose |
+| `tuck` | `(0, -1.40, 1.40, 0)` | Arm folded over the base footprint |
+| `pick` | `(0, -0.60, 0.80, -0.40)` | Extended forward, wrist level for a top-down approach |
+| `place` | `(0, 0.20, 0.80, -0.40)` | Extended forward, wrist raised to clear table edges |
+
+The gripper is intentionally **not** driven by presets, pick-and-place sequences interleave preset arm moves with explicit gripper open/close calls.
+
+```bash
+ros2 service call /lupin/arm/preset lupin_msgs/srv/SetArmPreset "{name: home}"
+```
+
+## Boot-time auto-home
+
+`auto_home` (`lupin_hmi/auto_home.py`, node name `lupin_auto_home`) is a one-shot run by `lupin-auto-home.service` after `lupin-onboard.service`. It does two jobs:
+
+<Steps>
+<Step>
+**Self-heal the controller stack.** It lists controllers via `/controller_manager/list_controllers` and brings five `HEAL_TARGETS`, `joint_state_broadcaster`, `pid_wheels_controller`, `mirte_master_arm_controller`, `mirte_master_gripper_controller`, `mirte_base_controller`, to `active`: `LoadController` for missing, `ConfigureController` for unconfigured, `SwitchController` (BEST_EFFORT) for inactive. This closes the vendor first-boot spawner race.
+</Step>
+<Step>
+**Park the arm in the safe pose.** It waits up to 30 s each for `/joint_states` (all 4 arm joints) and `/lupin/arm/preset`, settles 2 s, then calls the preset service with `name='home'`, parking in the minimum-gravity-moment pose to avoid the Hiwonder `shoulder_lift` thermal trip that latches when the servo is held against gravity.
+</Step>
+</Steps>
+
+If controller state is unverifiable the node exits cleanly (returns from heal as `None` → exit 0) to avoid a `Restart=on-failure` retry storm. Opt out with the environment variable `LUPIN_AUTO_HOME=false`.
+
+<Callout type="info">
+  systemd boot units do not re-fire on resume-from-suspend: a failed `Type=oneshot` `lupin-auto-home` stays failed, so no heal runs and controllers can come up unconfigured. The operator re-trigger is `reset-failed` + `start` (handled by `post-boot-sync.sh`). See [Operations](/docs/operations).
+</Callout>
+
+## Sim-only adapters
+
+Two pieces exist only in Gazebo so the unchanged web HMI works there:
+
+- **`arm_sim_shim`** exposes the real-robot Hiwonder service/topic names (`/io/servo/hiwonder/<arm_joint>/set_angle_with_speed`, `/io/servo/hiwonder/enable_all_servos`) on top of ros2_control, forwarding to `/mirte_master_arm_controller/joint_trajectory` and republishing `/joint_states` as `mirte_msgs/msg/ServoPosition` for HMI feedback. It is **not** launched on the real robot, where `mirte_telemetrix_cpp` serves those names natively.
+- **`arm_calibrate_server`** (hardware-only) exposes `/lupin/arm/calibrate` (`lupin_msgs/srv/CalibrateArm`, actions `start|commit|cancel|status`) for the operator-in-the-loop Hiwonder zero-offset flow. It has no effect in sim (no `_set_offset` services), so `start` times out there.
+
+<Cards>
+  <Card title="Web HMI & voice" href="/docs/web-hmi">The browser console and voice agent that drive `/cmd_vel_manual` and the arm services.</Card>
+  <Card title="Navigation" href="/docs/navigation">Nav2's `velocity_smoother`, the priority-10 source on the same bus.</Card>
+  <Card title="Operations" href="/docs/operations">Bring-up order, the auto-home re-trigger, and recovery from controller wedges.</Card>
+  <Card title="Interfaces" href="/docs/interfaces">The `lupin_msgs` `SetArmPreset` and `CalibrateArm` service contracts.</Card>
+</Cards>

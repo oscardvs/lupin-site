@@ -1,0 +1,415 @@
+---
+title: Interfaces
+description: Every custom message and service in lupin_msgs, the typed contracts the mission, perception, twin, and arm packages publish, subscribe, and call against.
+---
+
+`lupin_msgs` is the interface-definition package: a single `ament_cmake` package
+that holds **every** custom ROS 2 message and service in the Lupin stack. It
+ships no nodes and no launch files, only the typed contracts that the mission
+orchestrator, perception aggregator, digital twin, and arm servers link against.
+Ten messages and six services are generated over `std_msgs`, `geometry_msgs`,
+`sensor_msgs`, and `builtin_interfaces`.
+
+This page is the reference for all of them. Every field below is taken verbatim
+from the `.msg` / `.srv` source.
+
+## Cross-cutting design patterns
+
+Four conventions recur across these interfaces. Read these first, they explain
+*why* the individual definitions look the way they do.
+
+### The polymorphic Observation envelope
+
+Everything the mission emits about the world travels in **one** message type,
+[`Observation`](#observation), rather than a topic per observation kind. A
+`uint8 kind` field with `KIND_*` constants selects **at most one** of three
+typed sub-messages (`TagReading`, `FlowerObservation`, `AnomalyReport`); the
+others are default-zeroed.
+
+<Callout type="info">
+  The contract mandates that consumers **switch on `kind` and ignore unknown
+  kinds** rather than failing. New observation types are added by appending a
+  constant plus a typed field, so the stack extends without breaking existing
+  subscribers.
+</Callout>
+
+### The latched-snapshot pattern
+
+[`TwinState`](#twinstate), [`DiscoveredTags`](#discoveredtags), and
+[`MissionState`](#missionstate) are designed to be published with **RELIABLE +
+TRANSIENT_LOCAL, depth 1** (latched). A late-connecting HMI, or an orchestrator
+that subscribes only *after* a mission starts, immediately receives the full
+current world state with no bootstrap round-trip. Each is a periodic full-table
+snapshot, not a delta stream, and an **empty array is a legitimate startup
+state, not an error**.
+
+### The `orientation.w == 0` "never observed" sentinel
+
+Across `Observation.tag_pose_in_map`, `TwinTagState.pose`, and
+`ConfirmTag.tag_pose_in_map`, a `geometry_msgs/Pose` whose `orientation.w == 0`
+means **"this pose was never populated"**, there is no separate validity flag.
+The digital twin and HMI treat such a pose as missing and place no map pin.
+
+### Sim vs hardware gates
+
+[`CalibrateArm`](#calibratearm) and [`ConfirmTag`](#confirmtag) are
+**hardware-only**. In simulation the arm shim has no Hiwonder offset services and
+refuses to calibrate, and the bridge already returns readings keyed by tag id so
+visual confirmation is unnecessary. The sensor-bearing messages, by contrast,
+are simulator-driven. One interface set spans both targets.
+
+---
+
+## Mission
+
+### Observation
+
+Polymorphic envelope for anything the mission emits about the world. Carried on
+the observation feed the digital twin ingests.
+
+```text
+std_msgs/Header header
+string mission_id
+string source                    # e.g. "InspectionMission", future: "MappingMission"
+
+uint8 KIND_TAG_READING=0
+uint8 KIND_FLOWER=1
+uint8 KIND_ANOMALY=2
+uint8 kind
+
+uint8 STATUS_OK=0
+uint8 STATUS_UNREACHABLE=1
+uint8 STATUS_SCAN_FAILED=2
+uint8 STATUS_SKIPPED=3
+uint8 status
+string status_detail             # free-text reason on non-OK; empty on OK
+
+# At most one of these is populated per message, selected by `kind`.
+TagReading tag_reading
+FlowerObservation flower
+AnomalyReport anomaly
+
+geometry_msgs/Pose tag_pose_in_map
+```
+
+`tag_pose_in_map` is the map-frame pose at observation time, populated by the
+orchestrator from the latest AMCL snapshot. Per the sentinel rule above,
+`orientation.w == 0` means the orchestrator had no localized pose and the value
+is missing.
+
+### MissionState
+
+Periodic snapshot of the mission orchestrator, published at a fixed rate
+(default 5 Hz) whenever the node is alive; fields go empty when no mission runs.
+
+```text
+std_msgs/Header header
+string mission_id                # empty when no mission active
+string mission_type              # "InspectionMission" | "ExplorationMission" | ""
+string lifecycle_state
+string mission_phase
+string current_target            # tag_id being processed, "" otherwise
+uint16 targets_total
+uint16 targets_completed         # status=OK
+uint16 targets_failed            # status=SCAN_FAILED
+uint16 targets_unreachable       # status=UNREACHABLE
+uint16 targets_skipped           # status=SKIPPED (abort + skip_current)
+string last_error
+uint16 tags_discovered
+uint16 discovery_goal
+bool   estop_engaged
+bool   paused
+builtin_interfaces/Time started_at  # zero stamp when no mission has started yet
+```
+
+The top-level FSM `lifecycle_state` is one of:
+`BOOT | READY | PREPARE | EXPLORING | INSPECTING | MONITORING | RETURNING | DONE | FAULT`.
+`EXPLORING` (frontier search) and `MONITORING` (continuous re-scan loop) are
+entered only by an `ExplorationMission`. `mission_phase` is the sub-state, e.g.
+`NAVIGATING`, `SCANNING`, `PUBLISHING`, `LOCALIZING`, and is empty when the
+active state has no sub-machine. `tags_discovered` / `discovery_goal` track
+exploration progress and are both 0 for an `InspectionMission`.
+
+### StartMission
+
+Request the orchestrator to begin a mission.
+
+```text
+string mission_type              # "InspectionMission" | "ExplorationMission"
+string[] tag_sequence            # InspectionMission: empty = all tags (tag_locations.json, numeric order)
+                                 # ExplorationMission: ignored (targets are discovered)
+uint16 discovery_goal            # ExplorationMission only; 0 = use orchestrator param default
+---
+bool accepted
+string mission_id                # populated on accept (mission_id_prefix + uuid hex)
+string error_message             # populated on reject; empty on accept
+```
+
+The request is **rejected** when `lifecycle_state` is `FAULT`, when a mission is
+already running (`lifecycle_state` in `{PREPARE, EXPLORING, INSPECTING,
+MONITORING, RETURNING}`), or when `mission_type` is unknown to the build.
+Otherwise the orchestrator transitions `READY → PREPARE`.
+
+---
+
+## Perception
+
+### TagReading
+
+Bundled sensor readings observed at a single greenhouse tag. This is the payload
+of an `Observation` with `kind == KIND_TAG_READING`.
+
+```text
+string tag_id                              # matches mdp-greenhouse tag IDs
+builtin_interfaces/Time stamp              # wall-clock time when the bridge polled the simulator
+float64 sim_time_of_day_seconds            # sim-internal time of day in [0, 86400)
+SensorReading[] readings                   # one entry per sensor exposed at this tag
+```
+
+### SensorReading
+
+A single sensor measurement at a tag location. The element type of
+`TagReading.readings` and `TwinTagState.readings`.
+
+```text
+string name      # e.g. "temperature", "humidity", "co2", "light", "soil_moisture"
+float64 value    # value in the sensor's natural units (sim is unit-agnostic)
+```
+
+### FlowerObservation
+
+Flower-detection observation, produced by `lupin_perception`'s
+`perception_aggregator` when it co-locates a YOLO flower classification with a
+discovered AprilTag. Carried inside an `Observation` with `kind == KIND_FLOWER`.
+
+```text
+string tag_id                              # the co-located AprilTag; twin keys per-tag state by this id
+geometry_msgs/PoseStamped pose             # map-frame pose of the co-located tag (frame_id == "map")
+string species                             # "tulip_red" | "tulip_white" | "tulip_pink"; "" if none
+float32 confidence                         # classification confidence [0, 1] for `species`
+bool anomaly                               # true when the YOLO "bug" class co-located with this tag
+```
+
+The `anomaly` bool rides the flower path (not `AnomalyReport`) because it is keyed
+by the same `tag_id` the twin merges on; standalone anomalies still use
+`KIND_ANOMALY`.
+
+### AnomalyReport
+
+Future anomaly observation (e.g. fallen plant, unexpected obstruction). Stubbed
+to lock the contract; nothing emits these yet. Payload of an `Observation` with
+`kind == KIND_ANOMALY`.
+
+```text
+geometry_msgs/PoseStamped pose
+string description
+uint8 severity                   # 0=info, increasing → more urgent
+```
+
+### DiscoveredTag
+
+One AprilTag discovered live by perception during an `ExplorationMission`.
+Produced by `perception_aggregator`, which projects the tag detector's per-tag TF
+into the map frame and fuses the YOLO flower classifier. Unlike
+`tag_locations.json` (a-priori), these are found at runtime.
+
+```text
+string tag_id                    # matches the detector + greenhouse-bridge id space
+geometry_msgs/Pose pose_in_map   # tag's actual location (solvePnP + TF lookup)
+string species                   # YOLO dominant flower class, or "" if none yet
+float32 species_confidence       # [0, 1]; 0.0 when species is empty
+bool anomaly                     # true when the YOLO "bug" class was seen at this tag
+uint32 sightings                 # confident detections fused into this entry
+```
+
+`sightings` lets consumers require `>= K` confident detections before trusting
+the pose, debouncing against a single noisy frame.
+
+### DiscoveredTags
+
+Latched snapshot of every AprilTag discovered so far during exploration.
+Published by `perception_aggregator` on `/perception/discovered_tags` with
+RELIABLE + TRANSIENT_LOCAL (depth 1). The orchestrator subscribes after a mission
+starts, counts distinct tags for the discovery goal, and reads `pose_in_map` for
+the monitoring approach poses.
+
+```text
+std_msgs/Header header
+DiscoveredTag[] tags
+```
+
+### GetTagReading
+
+Request a one-shot sensor reading for the specified greenhouse tag.
+
+```text
+string tag_id
+---
+uint8 STATUS_OK=0
+uint8 STATUS_UNKNOWN_TAG=1
+uint8 status
+string error_message    # empty when status == STATUS_OK
+TagReading reading      # populated when status == STATUS_OK; default-zeroed otherwise
+```
+
+<Callout type="info">
+  New status codes are added **at the end**; existing values must not change.
+  This keeps wire-compatibility with consumers compiled against an older build.
+</Callout>
+
+### ConfirmTag
+
+Visually confirm a specific AprilTag is in frame from the robot's current pose.
+Called by the orchestrator at the start of `SCANNING`, **before** the bridge call,
+when the `require_visual_confirmation` parameter is true. Implemented by an
+external perception node (e.g. `apriltag_ros` wrapped in a service shim).
+
+<Callout type="warn">
+  **Hardware-only.** Not implemented in sim, the simulator's bridge already
+  returns readings keyed by tag id, so visual confirmation is a hardware gate.
+</Callout>
+
+```text
+string expected_tag_id
+---
+bool detected
+float64 detection_confidence    # [0, 1]; implementation-specific scale
+geometry_msgs/Pose tag_pose_in_map  # zero when detected=false
+string error_message            # empty when detected=true
+```
+
+When the expected tag is never detected, the implementation sets `detected=false`
+and populates `error_message`; the orchestrator surfaces that string in
+`MissionState.last_error` and the HMI mission log. `tag_pose_in_map` is a future
+hook for visual servoing, the current orchestrator only inspects `detected`.
+
+---
+
+## Twin
+
+### TwinState
+
+Periodic snapshot of every tag the digital-twin node has observed so far,
+published at ~1 Hz on `/twin/state` with RELIABLE + TRANSIENT_LOCAL depth 1
+(latched). Empty `tags` is the legitimate startup state.
+
+```text
+std_msgs/Header header
+TwinTagState[] tags
+```
+
+### TwinTagState
+
+Snapshot of one greenhouse tag from the twin's perspective, emitted as a repeated
+field inside `TwinState`.
+
+```text
+string tag_id
+geometry_msgs/Pose pose                    # snapshotted on first scan; orientation.w == 0 = "never observed"
+SensorReading[] readings                   # latest reading per sensor type; index by name
+builtin_interfaces/Time last_observed      # absolute ROS time of most recent observation
+float32 stale_seconds                      # (now - last_observed) at publish time
+string species                             # YOLO dominant class; "" until classified
+float32 species_confidence                 # [0, 1]; 0.0 when species is empty
+bool anomaly                               # YOLO "bug" class seen at this tag (latest-wins)
+```
+
+The twin caches `pose` from the first OK observation and does not re-stamp it, so
+the HMI marker does not jitter on AMCL drift. `last_observed` is the durable
+freshness field that persists into FloraNova exports; `stale_seconds` is a
+publish-time convenience for the HMI's staleness fade, recomputed only at the 1 Hz
+tick.
+
+### GetField
+
+On-demand IDW (inverse-distance-weighted) interpolation of a sensor field over a
+2D map-frame bbox. Computed lazily on the twin node from per-tag observation
+buffers and cached by `(sensor_type, observation_count, bbox, resolution)`, so
+repeat calls with no new observations are free.
+
+```text
+string sensor_type            # "temperature" | "humidity" | "co2" | "light" | "soil_moisture"
+float32 resolution            # cell size, metres
+float32 bbox_min_x            # map-frame
+float32 bbox_min_y
+float32 bbox_max_x
+float32 bbox_max_y
+---
+bool ok                       # false on bad sensor_type / degenerate bbox
+string error_message
+float32[] values              # row-major, width*height; NaN for "no data"
+uint32 width                  # cells along x
+uint32 height                 # cells along y
+float32 origin_x              # map-frame x of cell (0, 0)
+float32 origin_y              # map-frame y of cell (0, 0)
+float32 resolution_used       # echoed back so the consumer doesn't re-derive it
+float32 value_min             # over the non-NaN cells; both 0 if all NaN
+float32 value_max
+uint32 sample_count           # how many observations contributed
+```
+
+Cells beyond `max_distance_to_nearest_tag` from any observed tag, or in
+unexplored map area when the twin clips to `/map`, are encoded as **NaN**. The
+HMI renders NaN as transparent, so the field only paints where data exists.
+
+---
+
+## Arm
+
+### SetArmPreset
+
+Move the 4-DOF arm to a named preset pose. Presets are defined on the server; the
+request carries only the name.
+
+```text
+string name
+---
+bool success
+string message
+```
+
+<Callout type="info">
+  The gripper jaw is **not** driven by this service, command it directly via
+  `/io/servo/hiwonder/gripper/set_angle_with_speed`.
+</Callout>
+
+### CalibrateArm
+
+Multi-step Hiwonder zero-offset calibration for the arm + gripper servos, driven
+as a small `start` / `commit` / `cancel` / `status` FSM.
+
+<Callout type="warn">
+  **Hardware-only.** In sim, `arm_sim_shim` has no Hiwonder offset services and
+  the server refuses to start the procedure.
+</Callout>
+
+```text
+string action
+---
+bool success
+string state                # "IDLE" | "AWAITING_POSE"
+string message
+string[] joint_names
+int32[] offsets_applied     # centidegrees actually written via _set_offset
+int32[] diffs_observed      # raw-tick diff (position - home + curr_offset)
+```
+
+The `action` values:
+
+| `action` | Effect |
+| --- | --- |
+| `start` | Disables the arm controller, zeroes offsets, commands angle 0, then disables all servos for hand-posing. `IDLE → AWAITING_POSE`. |
+| `commit` | Samples `ServoPosition.raw` for ~2 s, computes per-joint `(raw - home + curr_offset)` in centidegrees, writes to `/io/servo/hiwonder/<j>/_set_offset`, re-commands angle 0, re-enables `/enable_arm_control`. `→ IDLE`. |
+| `cancel` | Re-enables servos + arm control; offsets stay zeroed. `→ IDLE`. |
+| `status` | No side effects; returns current state. |
+
+`joint_names`, `offsets_applied`, and `diffs_observed` populate **only** on a
+successful `commit`, in server-side joint order.
+
+---
+
+<Cards>
+  <Card title="Mission orchestrator" href="/docs/mission">How StartMission, MissionState, and Observation drive the FSM.</Card>
+  <Card title="Perception" href="/docs/perception">Where TagReading, FlowerObservation, and DiscoveredTags come from.</Card>
+  <Card title="Digital twin" href="/docs/digital-twin">TwinState aggregation and the GetField heatmap service.</Card>
+</Cards>

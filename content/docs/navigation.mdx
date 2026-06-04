@@ -1,0 +1,242 @@
+---
+title: Navigation
+description: Nav2 tuned for the holonomic mecanum base, MPPI with an Omni motion model, narrow-aisle costmaps, and one launch file with AMCL or SLAM modes.
+---
+
+Lupin navigates with [Nav2](https://docs.nav2.org/) tuned end-to-end for a holonomic
+mecanum base. The whole stack is one package, `lupin_navigation`, with a single launch
+file and a single source-of-truth params file. The MPPI controller runs an `Omni`
+motion model so the base actually strafes sideways instead of having its lateral
+velocity samples thrown away, and the costmaps are sized for ~0.8 m greenhouse aisles
+rather than open rooms.
+
+The same config runs in Gazebo and on the real robot, the frames, odometry topic, and
+laser ranges are deliberately aligned across both.
+
+## One launch file, two modes
+
+`nav2.launch.py` stands up the full Nav2 lifecycle stack. A single `slam` argument
+selects between the two operating modes:
+
+- **`slam:=false` (default)**, localization against a *saved* map. Brings up
+  `map_server` + `amcl` + `lifecycle_manager_localization` alongside the navigation
+  half. AMCL owns the `map → odom` transform.
+- **`slam:=true`**, the localization half is dropped (via `UnlessCondition`) so an
+  *external* `slam_toolbox` node can own `/map` and the `map → odom` TF. Use this in a
+  world without a saved map (e.g. the greenhouse), where slam_toolbox builds the map
+  online and Nav2 plans against it.
+
+The navigation half is always launched: `controller_server`, `planner_server`,
+`behavior_server`, `bt_navigator`, `waypoint_follower`, `velocity_smoother`, and
+`lifecycle_manager_navigation`.
+
+All node parameters come from `config/nav2_params.yaml`, wrapped in a `RewrittenYaml`
+that substitutes `use_sim_time` and the map path (`yaml_filename`) at launch time.
+
+### Launch arguments
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `use_sim_time` | `true` | Use `/clock` from Gazebo. Set `false` on hardware. |
+| `autostart` | `true` | Lifecycle managers auto-activate their nodes. |
+| `slam` | `false` | If `true`, skip `map_server`/`amcl`/localization lifecycle manager. |
+| `map` | `<pkg>/maps/krr_house.yaml` | Saved map handed to `map_server` (non-SLAM mode). |
+| `params_file` | `<pkg>/config/nav2_params.yaml` | Nav2 params; override to fork tuning per branch. |
+
+<Tabs items={['Simulation','Hardware']}>
+<Tab value='Simulation'>
+
+Default mode uses the bundled saved map of the AWS small-house ("KRR house") world:
+
+```bash
+ros2 launch lupin_navigation nav2.launch.py use_sim_time:=true
+```
+
+SLAM mode for an unmapped world, run slam_toolbox separately, then launch Nav2:
+
+```bash
+ros2 launch slam_toolbox online_async_launch.py use_sim_time:=true \
+    slam_params_file:=$(ros2 pkg prefix lupin_navigation)/share/lupin_navigation/config/slam_toolbox_sim.yaml
+
+ros2 launch lupin_navigation nav2.launch.py use_sim_time:=true slam:=true
+```
+
+</Tab>
+<Tab value='Hardware'>
+
+The only difference is the clock source, wheel odometry, frames, and laser ranges are
+already identical to sim:
+
+```bash
+ros2 launch lupin_navigation nav2.launch.py use_sim_time:=false
+```
+
+SLAM mode is the same, with `use_sim_time:=false` on both launches:
+
+```bash
+ros2 launch slam_toolbox online_async_launch.py use_sim_time:=false \
+    slam_params_file:=$(ros2 pkg prefix lupin_navigation)/share/lupin_navigation/config/slam_toolbox_sim.yaml
+
+ros2 launch lupin_navigation nav2.launch.py use_sim_time:=false slam:=true
+```
+
+</Tab>
+</Tabs>
+
+## MPPI for a holonomic base
+
+The controller is `nav2_mppi_controller::MPPIController`, chosen from day one with no DWB
+detour. The single change that makes mecanum driving work is `motion_model: "Omni"`, on
+any other motion model MPPI zeroes the lateral (`vy`) samples and discards the holonomic
+capability entirely.
+
+The velocity envelope is asymmetric forward/back but symmetric sideways, so left-strafe
+and right-strafe trajectories are sampled equally:
+
+| Limit | Value | Note |
+| --- | --- | --- |
+| `vx_max` | `0.5` m/s | Forward |
+| `vx_min` | `-0.35` m/s | Reverse |
+| `vy_max` | `0.5` m/s | Strafe right |
+| `vy_min` | `-0.5` m/s | Strafe left (symmetric so samples don't collapse to 0) |
+| `wz_max` | `1.9` rad/s | Yaw |
+
+The MPPI rollout samples `batch_size: 2000` trajectories of `time_steps: 56` at
+`model_dt: 0.05`, running at `controller_frequency: 20.0` Hz. Lateral motion is treated
+as a first-class capability, not a fallback: the `min_y_velocity_threshold` is `0.001`
+(lateral motion is never gated), and `PreferForwardCritic` keeps a low `cost_weight: 1.0`
+(dropped from the diff-drive default of `5.0`) so MPPI doesn't bias away from a cleanly
+shorter sideways approach.
+
+<Callout type="info">
+  The MPPI acceleration envelope (`ax_max: 2.5`, `ay_max: 2.5`, `az_max: 3.2`) is kept in
+  sync with the velocity smoother's `max_accel`. If MPPI samples outside the smoother's
+  caps, the smoother chops the trajectory MPPI just optimised and `PathAlign` drifts.
+  Change one, change the other.
+</Callout>
+
+The global planner is `nav2_navfn_planner/NavfnPlanner` (Dijkstra: `use_astar: false`,
+`allow_unknown: true`, `tolerance: 0.5`).
+
+### Goal tolerance
+
+The goal checker (`nav2_controller::SimpleGoalChecker`) uses `xy_goal_tolerance: 0.25` and
+a tightened `yaw_goal_tolerance: 0.12` rad (~7°). The tight yaw tolerance frames the
+AprilTag head-on at the goal pose for the climate-data read.
+
+<Callout type="warn">
+  If the tight yaw tolerance bites on hardware, MPPI iterating near the goal blowing the
+  navigation timeout, loosen `yaw_goal_tolerance` back toward `~0.18` rad.
+</Callout>
+
+## Costmaps for narrow aisles
+
+Both costmaps model the robot as a circle with `robot_radius: 0.22` at
+`resolution: 0.05`. The inflation is deliberately thin so plant-row aisles stay drivable:
+
+| Parameter | Value | Rationale |
+| --- | --- | --- |
+| `robot_radius` | `0.22` | Circular footprint. |
+| `inflation_radius` | `0.30` | ~0.08 m clearance past the footprint; a 0.55 m halo would fully block a ~0.8 m aisle. |
+| `cost_scaling_factor` | `5.0` | Steep falloff keeps the halo thin so MPPI keeps drivable space mid-aisle. |
+| `always_send_full_costmap` | `False` | Publish incremental deltas, not the whole grid every cycle. |
+
+`always_send_full_costmap: False` is load-bearing on hardware: sending only changed cells
+cuts costmap publish bytes ~5–10× on KRR-house-scale maps, which keeps the Pi-side
+rosbridge JSON encoder below the threshold where it silently wedges.
+
+The local costmap is a 3×3 m rolling window updating at `5.0` Hz with an `obstacle_layer`
++ `inflation_layer` (laser-only in v1; the depth point cloud is available but not yet a
+costmap source). The global costmap adds a `static_layer` with
+`map_subscribe_transient_local: True` and tracks unknown space. Both clamp obstacle
+ranges to filter robot-body returns (`obstacle_min_range: 0.25`, `raytrace_min_range: 0.25`).
+
+## The cmd_vel chain
+
+Nav2 never publishes to `/cmd_vel` directly. The smoothed output is remapped to
+`/cmd_vel_auto`, which feeds the lupin `twist_mux` as the lowest-priority (autonomy)
+input. Autonomy therefore goes through the exact same arbitration the Xbox dead-man and
+web HMI teleop use:
+
+```text
+controller_server ──/cmd_vel_nav──▶ velocity_smoother ──/cmd_vel_auto──▶ twist_mux ──▶ drive controller
+```
+
+- `controller_server` has its `cmd_vel` output remapped to `/cmd_vel_nav` (the
+  inter-stage hop).
+- `velocity_smoother` subscribes to `/cmd_vel_nav` and has its `cmd_vel_smoothed` output
+  remapped to `/cmd_vel_auto`.
+
+The smoother's 3-DOF limits `[vx, vy, wtheta]` mirror the MPPI envelope:
+`max_velocity: [0.5, 0.5, 1.9]`, `min_velocity: [-0.35, -0.5, -1.9]`,
+`max_accel: [2.5, 2.5, 3.2]`. See [Teleop & manual control](/docs/teleop) for the
+twist_mux arbitration and priorities.
+
+## Sim/hardware parity
+
+Three params are aligned so the same config behaves identically in Gazebo and on the
+robot:
+
+- **`base_link` everywhere**, every node uses `base_link` as its base frame
+  (`amcl.base_frame_id`, all `robot_base_frame`, slam_toolbox `base_frame`). The MIRTE
+  URDF publishes no `base_footprint`.
+- **`odom_topic: /mirte_base_controller/odom`**, wheel-encoder odometry, used by
+  `bt_navigator`, `controller_server`, and `velocity_smoother`. This topic exists in both
+  sim and on hardware, unlike the sim-only teleport `/odom` feed.
+- **`min_laser_range: 0.25` m**, applied in AMCL (`laser_min_range`), slam_toolbox, and
+  both costmaps to filter lidar returns hitting the robot's own body. `12.0` m matches the
+  RPLidar A1 effective max.
+
+AMCL uses `nav2_amcl::OmniMotionModel` (a DiffDrive model would penalise the real lateral
+motion) and `set_initial_pose: true`, seeding belief at the vendor spawn pose
+(`x=1.0527, y=0.509611, yaw=0`) for headless restarts. The RViz **2D Pose Estimate** tool
+still works at runtime.
+
+## SLAM configuration
+
+`config/slam_toolbox_sim.yaml` runs slam_toolbox in `mode: mapping` with the Ceres
+solver, `resolution: 0.05`, and `scan_topic: /scan`. The notable tuning is
+`transform_publish_period: 0.10` (10 Hz, down from the 50 Hz default):
+
+<Callout type="info">
+  At 50 Hz the `map → odom` TF dominates DDS bandwidth and the Pi rosbridge encoder. 10 Hz
+  is plenty downstream, the local costmap runs at 5 Hz, the HMI map at ~5 Hz, and
+  controllers don't subscribe to `/tf`.
+</Callout>
+
+## Resetting the map
+
+slam_toolbox 2.6 (Humble) has no runtime "wipe map" service, `/slam_toolbox/clear_changes`
+only drops the localization edit buffer, not the scan-built occupancy grid. The
+`slam_reset_node` (entry point `slam_reset_node`) advertises a pragmatic operator service:
+
+```bash
+ros2 service call /lupin/nav/clear_map std_srvs/srv/Trigger {}
+```
+
+On call it:
+
+1. Best-effort clears both costmaps via
+   `/local_costmap/clear_entirely_local_costmap` and
+   `/global_costmap/clear_entirely_global_costmap` (`std_srvs/srv/Empty`, fire-and-forget,
+   so stale lethal cells don't linger under the robot).
+2. Sends `SIGTERM` to every process matching `async_slam_toolbox_node`.
+
+The Trigger response reports how many processes were killed. This relies on slam_toolbox
+being launched with `respawn=True` so it comes back with an empty pose graph and starts
+mapping from scratch (~5–10 s). The web HMI's **Erase map** button calls this same
+service.
+
+<Callout type="warn">
+  Because the reset works by killing and respawning the slam_toolbox *process*, it only
+  applies in SLAM mode (`slam:=true`). It does not reset a saved map served by `map_server`.
+</Callout>
+
+## See also
+
+<Cards>
+  <Card title="Mission orchestrator" href="/docs/mission">The state machine that issues NavigateToPose goals and per-tag approach poses.</Card>
+  <Card title="Teleop & manual control" href="/docs/teleop">The twist_mux that arbitrates `/cmd_vel_auto` against gamepad and HMI input.</Card>
+  <Card title="Architecture" href="/docs/architecture">Where Nav2 sits in the node/topic graph and the sim ↔ hardware boundary.</Card>
+  <Card title="Operations" href="/docs/operations">Bring-up order, the rosbridge wedge failure mode, and recovery.</Card>
+</Cards>

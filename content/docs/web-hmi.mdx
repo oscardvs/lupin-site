@@ -1,0 +1,211 @@
+---
+title: Web HMI & voice
+description: The browser mission console served on :8090, a cinematic, data-reactive cockpit with a living WebGL aurora, a 3D digital twin, seven tabs over rosbridge, a 16-tool Gemini Live voice agent, and a permanent software E-stop.
+---
+
+The Lupin **web HMI** is a single-page mission console, Vite + React + Tailwind + shadcn/ui, that talks to ROS 2 entirely over rosbridge. There are no `rclpy` nodes in `lupin_web`: `setup.py` declares no console scripts, and the `lupin_web/` Python module is an empty placeholder. Everything the operator does in the browser becomes a rosbridge publish, subscribe, or service call.
+
+It is built to **coexist with, never replace, the vendor MIRTE web stack**. It binds only three ports, `8090` (UI), `8091` (camera MJPEG), `9090` (rosbridge), and leaves the course UI on `:80` and the vendor `web_video_server` on `[::1]:8181` untouched. If `lupin_web` crashes, the course interface stays up.
+
+## A cinematic, data-reactive cockpit
+
+The console is built around one rule, **depth-as-information, telemetry-as-motion**. A living WebGL aurora drifts behind solid instrument panels and shifts mood with the robot's state (calm when idle, brighter while a mission runs, a slow red wash on E-stop). Motion only happens when ROS data changes or the operator acts; nothing animates for decoration's sake.
+
+<ScreenGallery shots={[
+  { src: '/hmi/hmi-teleop.png', alt: 'Teleop view', caption: 'Teleop · twin joysticks over the living aurora' },
+  { src: '/hmi/hmi-arm.png', alt: 'Arm view with 3D twin', caption: 'Arm · a live 3D twin mirrors joint_states + odom' },
+  { src: '/hmi/hmi-telemetry.png', alt: 'Telemetry view', caption: 'Telemetry · spring-eased ring gauge + number tickers' },
+  { src: '/hmi/hmi-map.png', alt: 'Map / Nav view', caption: 'Map · live SLAM grid, Nav2 plan, mission controls' },
+  { src: '/hmi/hmi-voice.png', alt: 'Voice view', caption: 'Voice · an audio-reactive Gemini Live orb' },
+  { src: '/hmi/hmi-cameras.png', alt: 'Cameras view', caption: 'Cameras · MJPEG tiles with AprilTag overlay' },
+]} />
+
+### Signature systems
+
+- **Living WebGL aurora**, a single full-screen fbm shader (react-three-fiber) drifts chartreuse↔cyan behind everything, tinted by connection / mission / E-stop state. A fixed dark scrim keeps text contrast deterministic; it clamps DPR, pauses when the tab is hidden, and falls back to a pure-CSS gradient under `prefers-reduced-motion` or without WebGL.
+- **Live 3D digital twin**, a procedural mecanum rover + 4-DOF arm (no model download, offline-safe for AP-mode demos) driven by the *same* `joint_states` / `odom` the 2D widgets read, so 2D and 3D never disagree. It flags **STALE** if telemetry goes silent (the documented rosbridge silent-wedge tell).
+- **Cinematic boot handshake**, a power-on sequence whose log advances off real rosbridge milestones (link → handshake → telemetry → live), shown **once per session**, always skippable, with a failsafe watchdog so a wedged link never traps the operator.
+- **Telemetry-as-motion**, battery, voltage and joint readouts roll on springs into fixed-width `tabular-nums` slots and flash on meaningful change; the battery ring shifts chartreuse → amber → red across thresholds. High-rate streams (`cmd_vel`, raw IMU) are shown raw, never spring-smoothed.
+- **Glass on overlays only**, frosted glass is reserved for floating Radix surfaces (settings, dialogs, tooltips); always-on instrument tiles stay solid for legibility.
+
+### Built for every screen
+
+The layout is bulletproof from a 390 px phone to a 1920 px wall console, the tab bar collapses to icons, panels reflow to a single column, and the 3D twin renders even on mobile.
+
+<ScreenGallery shots={[
+  { src: '/hmi/hmi-teleop-phone.png', alt: 'Teleop on a phone', caption: 'Teleop · phone', phone: true },
+  { src: '/hmi/hmi-telemetry-phone.png', alt: 'Telemetry on a phone', caption: 'Telemetry · phone', phone: true },
+]} />
+
+<Callout type="info">
+Every effect honours `prefers-reduced-motion` and `prefers-reduced-transparency`: animations freeze to a single frame and glass drops to solid, but **information is never removed**, handshake status, live values, and state changes still read.
+</Callout>
+
+## Ports and processes
+
+| Port | Process | Role |
+|------|---------|------|
+| `8090` | Vite (`npm run preview` / `dev`) | Serves the SPA. Chosen to dodge `:80` (course UI), `:8080` (wifi-connect AP captive portal), `:9090` (rosbridge). |
+| `8091` | `web_video_server` (`lupin_web_video_server`) | LAN-reachable MJPEG on `0.0.0.0` for the Cameras tab. Vendor's instance stays localhost-only. |
+| `9090` | `rosbridge_websocket` | JSON/CBOR broker the browser connects to. |
+
+The frontend defaults its rosbridge URL to the same-origin proxy path `ws(s)://<host>/_ros` (which Vite forwards to `localhost:9090`); the Settings drawer overrides that and every topic name, persisting to `localStorage`.
+
+## The seven tabs
+
+A persistent top bar (logo, rosbridge pill, battery pill, clock, settings gear, and the permanent E-STOP) wraps seven tabs:
+
+- **Teleop**, two virtual joysticks (left = linear x/y, right = angular z), live Twist readout, speed-scale slider, mirrored stop button. Publishes to `cmdVelTopic` at 20 Hz while a stick is active. See [Teleop & manual control](/docs/teleop).
+- **Arm**, per-joint sliders for the 4-DOF Hiwonder arm (shoulder pan/lift, elbow, wrist) plus the gripper jaw, calling `mirte_msgs/srv/SetServoAngleWithSpeed` through `/lupin/arm/<joint>/set_angle_with_speed` and `/lupin/gripper/set_angle_with_speed`. Init, enable/disable torque, and operator-in-the-loop calibration live here too.
+- **Voice**, push-to-talk console wired to Google's Gemini Live API. See **Voice agent** below.
+- **Cameras**, MJPEG stream pulled from `web_video_server`'s `/stream?topic=` endpoint (not a direct rosbridge subscription). An "Overlay AprilTags" switch renders corner boxes + ID + range from `/camera/tag_detections_json` (`std_msgs/msg/String`, a JSON array packed by `lupin_perception/tag_annotator`).
+- **Telemetry**, top-down Lidar canvas (`/scan`), IMU (`/io/imu/movement/data`), Odometry (`/mirte_base_controller/odom`), Battery + voltage sparkline (`/io/power/power_watcher`), and arm joints (`/joint_states`).
+- **Logs**, live `/rosout` tail (`rcl_interfaces/msg/Log`) with severity filter, node filter, search, pause/clear, capped at 500 rows.
+- **Map/Nav**, live SLAM grid (`/map`), browser-computed robot pose, the latest Nav2 `/plan` as a chartreuse polyline, click-and-drag to publish a `geometry_msgs/msg/PoseStamped` to `/goal_pose`, twin-driven tag pins and flower rings, and Mission Controls (Start exploration, pause/resume/abort/skip). See [Mission orchestrator](/docs/mission).
+
+<Callout type="info">
+The HMI publishes drive commands to `/cmd_vel_manual` (the default `cmdVelTopic`), which is the `manual` input of `twist_mux` (priority 50), **not** the controller directly. Routing through the mux is what lets manual driving and Nav2 share the bus without racing.
+</Callout>
+
+### Telemetry topics use the robot's real names
+
+The default topics in `settings.ts` target the topics that actually have publishers on the real Mirte, not the canonical aliases:
+
+| What | Subscribed topic | Why not the obvious name |
+|------|------------------|--------------------------|
+| IMU | `/io/imu/movement/data` | `/imu/data` has no publisher on the real robot. |
+| Battery | `/io/power/power_watcher` | `/battery_state` is advertised but never published. |
+
+## Browser-side TF tree walking
+
+ROS 2 has no `tf2_web_republisher` and `ROSLIB.TFClient` cannot follow the graph, so the HMI computes the robot's map-frame pose itself. `RosProvider` subscribes to `/tf` and `/tf_static` (`tf2_msgs/msg/TFMessage`) with **CBOR** binary compression, throttled to roughly 10 Hz, walks the transform tree (quaternion-to-yaw, chained 2D composition) down to a `map → base_link` pose, and re-renders only when the pose moves more than ~5 mm or ~0.005 rad. The same composed pose backs the voice `save_named_location` and `nav_forward` tools.
+
+CBOR is deliberate: subscribing in binary keeps the JSON-encode CPU for the `/tf` and `/scan` flood off the Orange Pi.
+
+## The permanent software E-stop
+
+The E-stop is **permanent UI furniture, not a button**, a red full-height bar on every screen.
+
+- It **boots engaged** (reason `startup`). Nothing drives until the operator clears it.
+- While active it **gates every `cmd_vel` publish** (`useCmdVel` is the only sanctioned Twist path) and **heartbeats a zero Twist at 20 Hz** so it owns the drive bus.
+- On every trigger it fire-and-forgets `action_msgs/srv/CancelGoal` (the zero-UUID cancel-all) at **both** Nav2 servers: `/navigate_to_pose/_action/cancel_goal` and `/navigate_through_poses/_action/cancel_goal`. On a BEST_EFFORT `cmd_vel` bus you have to cancel the goal to actually stop Nav2's velocity smoother, the heartbeat alone won't.
+- It **auto-trips** on `beforeunload` (page unload) and rosbridge disconnect, always; and on `visibilitychange` / `blur` (tab-hide, window-blur) when `estopAutoOnFocusLoss` is on (default `true`).
+- Reset is **manual**.
+
+<Callout type="warn">
+There is no hardware kill switch in this path, the E-stop is a software gate over the rosbridge `cmd_vel` channel. It is a safe-by-default operator control, not a safety-rated interlock.
+</Callout>
+
+## Voice agent
+
+The Voice tab opens a single bidirectional WebSocket from the browser **directly** to Google's Gemini Live API (`geminiModel` default `models/gemini-3.1-flash-live-preview`). One stream carries 16 kHz mono PCM-16 mic audio in, and the model's voice, transcripts, and native function calls back. There is no separate STT/LLM/TTS pipeline.
+
+The model is given a **16-tool function-calling surface**, declared at session start in `web/src/lib/voice/tools.ts` and dispatched in `web/src/lib/voice/session.tsx` against the live ROS and E-stop providers:
+
+| Tool | Purpose |
+|------|---------|
+| `drive` | Short Twist burst (`linear_x/y`, `angular_z`); `duration_s` clamped to `[0.1, 2.0]`. |
+| `stop` | Publish a zero Twist immediately. Always safe. |
+| `nav_goto` | Nav2 goal at absolute map-frame `x, y, yaw` via `/goal_pose`. |
+| `nav_forward` | Pose offset from the current position in the body frame (`forward_m`, `lateral_m`, `rotate_deg`); HMI reads `map→base` TF, rotates, sends the absolute goal. Fails if localization is down. |
+| `rotate` | Rotate in place by a relative `angle_deg` using the Nav2 planner. Requires localization. |
+| `nav_goto_named` | Nav2 goal to a pre-configured named location key. |
+| `nav_cancel` | Cancel any in-flight Nav2 goal (idempotent). Does not stop teleop. |
+| `save_named_location` | Snapshot the current `map→base` pose under a name. Fails without localization. |
+| `list_named_locations` | Return the current named-locations dictionary (discovery for `nav_goto_named`). |
+| `arm_preset` | Move the arm to a named preset: `home`, `zero`, `tuck`, `pick`, `place`. |
+| `gripper` | Move the jaw: `open`, `close`, or `set` to a `percent` opening (conservative ±30° window). |
+| `calibrate_arm` | Operator-in-the-loop Hiwonder zero-offset calibration: `start` / `commit` / `cancel` / `status`. Hardware-only. |
+| `set_speed_cap` | In-memory multiplier in `[0, 1]` on the `voiceMax*` limits for this session. |
+| `query_state` | Read-only: fetch `pose`, `battery`, `estop`. Never moves the robot. |
+| `engage_estop` | Trigger the software E-stop (reason `voice-agent`); reset stays manual. |
+| `speak` | Push text into the transcript with no motion or audio. |
+
+Every motion-producing tool routes through the **same E-stop and the same saturating speed caps** as the manual joystick. When the E-stop is engaged, those calls return `ok:false` with an `e-stop active` message and the system prompt tells the model to back off. `drive` is additionally clamped per-call to `voiceMaxLinearMps` / `voiceMaxAngularRps` (defaults `0.3 m/s` / `0.8 rad/s`), with the `set_speed_cap` multiplier on top, so the agent physically cannot exceed those limits or move while the bar is engaged.
+
+<Callout type="info">
+Tools without a real backend are **deliberately not declared**. A tool that always errors trains the model to stop calling it; one that silently succeeds trains it to hallucinate. So `scan_apriltags`, `detect_flowers`, `get_camera_frame`, and `record_observation` are absent until their services exist.
+</Callout>
+
+### Calibration safety prompt
+
+The `calibrate_arm` tool is hard-prompted to **never** call `action='commit'` in the same turn as `start`. `start` disables the servos and the arm goes limp for hand-posing; committing immediately would write zero offsets to whatever pose the arm happened to fall into. The model must wait for an explicit operator utterance ("go ahead", "commit", "I've moved the arm") before committing.
+
+### Setup
+
+<Steps>
+<Step>Get an API key at `aistudio.google.com` (free tier is enough for a demo).</Step>
+<Step>Open Settings → Voice → API key and paste it. It is persisted to `localStorage` only.</Step>
+<Step>Optionally set the BCP-47 language, system prompt, named-locations JSON, the `voiceMax*` caps, and push-to-talk vs open-mic.</Step>
+<Step>Switch to the Voice tab, hit **Start session**, then hold the mic.</Step>
+</Steps>
+
+<Callout type="warn">
+The API key is sent as a `?key=` query parameter on the WebSocket, the browser holds the secret. This is acceptable only on a LAN-only demo. Do not expose this UI on the public internet without first wiring the ephemeral-token broker (Google's `auth_tokens.create` is the supported path).
+</Callout>
+
+The voice tab needs a **secure context** for the mic API, so on the robot the HMI must be served over HTTPS (`tls:=true`). On `localhost` (sim/dev) plain HTTP already counts as secure, so `tls` stays `false`.
+
+## Offline mock mode
+
+Append `?mock=1` to the URL (or run `npm run dev -- --mode mock`) and `RosProvider` swaps in synthetic per-message-type generators while the Voice tab runs a scripted session that still exercises real tool dispatch. All seven tabs work with no robot attached, a clean walkthrough in mock mode is the bar for "demoable." A missing Gemini key also drops the Voice tab into the same mock harness.
+
+## Hardware polarity
+
+On Mirte-247264 the wheel wiring is inverted, so the HMI corrects it **at the human-facing surface only**. With the `polarityInvertHmi` setting on (default `true` on hardware, `false` in sim), joystick and voice `cmd_vel`, map-click goals, and the map view are flipped 180° about Z. The internal Nav2/SLAM frame is left untouched, it stays internally consistent. There are no sign hacks downstream of this single setting.
+
+## Running it
+
+The HMI ships inside `lupin_bringup`, one laptop command brings up Nav2, SLAM, RViz, **and** the HMI (on by default; pass `web:=false` to skip it). To run the console on its own, use the package launch directly:
+
+<Tabs items={['Simulation','Hardware']}>
+<Tab value='Simulation'>
+
+```bash
+# Co-located rosbridge + LAN video, plain HTTP on localhost
+ros2 launch lupin_web lupin_web.launch.py
+# or with hot-reload
+ros2 launch lupin_web lupin_web.launch.py mode:=dev
+```
+
+In sim the default drive topic must be re-pointed once: open Settings and set `cmdVelTopic` to the simulator's controller input, and turn `polarityInvertHmi` off.
+
+</Tab>
+<Tab value='Hardware'>
+
+```bash
+# Defer to the vendor rosbridge, keep raw frames on the Pi, serve HTTPS for the mic
+ros2 launch lupin_web lupin_web.launch.py \
+  rosbridge:=false \
+  video:=false video_target:=http://192.168.42.1:8091 \
+  tls:=true
+```
+
+Browsers warn about the self-signed cert, accept it once per device, then open `https://<host>:8090`.
+
+</Tab>
+</Tabs>
+
+The launch arguments:
+
+| Arg | Default | Effect |
+|-----|---------|--------|
+| `port` | `8090` | UI HTTP/HTTPS port. |
+| `mode` | `preview` | `preview` serves a built `dist/`; `dev` runs the Vite dev server with HMR. |
+| `video` | `true` | Spawn the LAN `web_video_server` on `0.0.0.0:8091`. Set `false` on the robot (`lupin-cameras.service` already exposes it). |
+| `video_target` | `http://localhost:8091` | Where Vite forwards `/_video` proxy requests; point at the robot on hardware. |
+| `rosbridge` | `true` | Co-locate `rosbridge_websocket` on `:9090`. Set `false` on the robot to defer to the vendor instance and avoid a bind conflict. |
+| `tls` | `false` | Serve HTTPS with a self-signed cert. Required for the Voice tab on the robot. |
+
+<Callout type="warn">
+The launch file prints a loud DDS-mode banner. If `ROS_DISCOVERY_SERVER` is unset, the co-located rosbridge runs in default multicast and will **not** join the robot's FastDDS discovery graph, the HMI shows LIVE but no battery, no telemetry, and cannot drive. The fix is to source `~/.config/lupin/ros-env.sh` (then the workspace) in the launching terminal and relaunch. The env is per-process, so a healthy `ros2 topic list` in another terminal will hide this.
+</Callout>
+
+## See also
+
+<Cards>
+  <Card title="Teleop & manual control" href="/docs/teleop">Joysticks, the command-arbitration bus, and gamepad driving.</Card>
+  <Card title="Mission orchestrator" href="/docs/mission">The state machine the Map tab's Mission Controls drive.</Card>
+  <Card title="Operations" href="/docs/operations">Bring-up order, the DDS-env gotcha, and recovery.</Card>
+  <Card title="Interfaces" href="/docs/interfaces">The `lupin_msgs` services the voice tools call.</Card>
+</Cards>

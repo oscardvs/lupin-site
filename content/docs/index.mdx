@@ -1,0 +1,72 @@
+---
+title: Overview
+description: Lupin is an autonomous greenhouse robot, Nav2 autonomy, AprilTag + YOLO perception, a live digital twin, and a voice-controlled mission console, all on ROS 2.
+---
+
+**Lupin** is an autonomous greenhouse robot built on the MIRTE Master V2 (a holonomic
+4-mecanum base with a 4-DOF arm). It explores and patrols the rows with Nav2, reads
+climate data off AprilTags, finds and grades flowers with YOLO, and streams everything
+into a **live digital twin** you can drive from a browser, or by voice.
+
+It is a [ROS 2](https://docs.ros.org/en/humble/) Humble workspace organised as nine
+packages, and the *same code runs in Gazebo and on the real robot*, only the
+deployment branch and a single drive topic change.
+
+<Callout type="info">
+  This site documents the **`hardware` branch**, where most of the implementation runs.
+  Commands are split into **Simulation** and **Hardware** tabs wherever they differ.
+</Callout>
+
+## How it works
+
+Lupin turns an empty map into a queryable model of a greenhouse in one pipeline:
+
+```text
+Explore ──▶ Navigate ──▶ Perceive ──▶ Twin ──▶ HMI / Voice
+(frontier   (Nav2 MPPI)  (AprilTag    (/twin/   (:8090
+ BFS)                     + YOLO)      state)    console)
+```
+
+A mission orchestrator frontier-explores the live SLAM map until it has discovered *N*
+AprilTag stations, drives an approach pose at each, reads its climate tag and assesses
+its flowers, and publishes every reading as a typed observation. A digital-twin node
+aggregates those observations into a latched world snapshot and an on-demand sensor
+heatmap, which the web console renders live.
+
+## Start here
+
+<Cards>
+  <Card title="Quickstart" href="/docs/quickstart" icon="Rocket">
+    Bring Lupin up in simulation in one command, then point it at the real robot.
+  </Card>
+  <Card title="Architecture" href="/docs/architecture" icon="Network">
+    The node/topic graph, the sim ↔ hardware boundary, and how the packages fit together.
+  </Card>
+  <Card title="Hardware" href="/docs/hardware" icon="Cpu">
+    The MIRTE Master V2 platform, sensors, actuators, compute, and known quirks.
+  </Card>
+  <Card title="Interfaces" href="/docs/interfaces" icon="Braces">
+    The custom message and service contracts every package links into.
+  </Card>
+</Cards>
+
+## The stack, page by page
+
+- **[Navigation](/docs/navigation)**, Nav2 tuned for a mecanum base: MPPI controller, Omni motion model, narrow-aisle costmaps, AMCL/SLAM modes.
+- **[Mission orchestrator](/docs/mission)**, the hierarchical state machine: exploration → monitoring, per-tag approach poses, pause/E-stop policy.
+- **[Perception](/docs/perception)**, AprilTag detection (OpenCV ArUco), YOLO flower detection, and the aggregator that fuses them.
+- **[Digital twin](/docs/digital-twin)**, `/twin/state` aggregation and the inverse-distance-weighted `get_field` heatmap service.
+- **[Greenhouse bridge](/docs/greenhouse-bridge)**, the ROS wrapper around the course environmental simulator.
+- **[Web HMI & voice](/docs/web-hmi)**, the browser mission console and its 16-tool voice agent.
+- **[Teleop & manual control](/docs/teleop)**, gamepad/keyboard driving, arm presets, the command-arbitration bus.
+
+## Reference
+
+- **[Interfaces](/docs/interfaces)**, every `lupin_msgs` message and service.
+- **[Operations](/docs/operations)**, the hard-won runbook: bring-up order, failure modes, recovery.
+- **[Deploy & networking](/docs/networking)**, systemd units and the laptop ↔ robot DDS setup.
+
+<Callout type="warn">
+  Lupin is a student project for RO47007 MDP (TU&nbsp;Delft). The robot source lives on a
+  private GitLab; this documentation site is the open-source, public face of the project.
+</Callout>

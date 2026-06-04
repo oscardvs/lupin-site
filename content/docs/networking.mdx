@@ -1,0 +1,247 @@
+---
+title: Deploy & networking
+description: How Lupin splits across the robot's systemd services and the laptop's one-command launch, plus the FastDDS-over-WiFi link that connects them.
+---
+
+Lupin runs on two machines. The **robot** keeps the controller-facing nodes alive on systemd the moment it boots, so manual drive, arm, and gripper work with no laptop attached. The **laptop** brings up the whole autonomy and HMI stack, HMI, SLAM, Nav2, twin, mission, perception, RViz, with a single `ros2 launch`. The two halves find each other over WiFi through the vendor MIRTE image's FastDDS discovery server.
+
+This split is deliberate: the robot only does what must live close to the hardware; everything CPU-heavy (JSON encoding for the HMI, Nav2, SLAM, the torch-based YOLO detector) runs on the laptop where there is headroom.
+
+## The robot / laptop split
+
+| Lives on | Brought up by | Nodes / services |
+| --- | --- | --- |
+| Robot | `mirte-ros.service` (vendor) | telemetrix, ros2_control, RPLidar → `/scan`, cameras, vendor `rosbridge_websocket` :9090 (idle, the HMI does not connect here), vendor `web_video_server` :8181 |
+| Robot | `lupin-onboard.service` | `twist_mux`, `arm_preset_server`, `arm_calibrate_server`, `gripper_action_bridge` |
+| Robot | `lupin-cameras.service` | kills vendor cameras, relaunches Orbbec + USB gripper cams at config FPS, robot-side `web_video_server` :8091 |
+| Robot | `lupin-auto-home.service` | oneshot at boot, heals stuck controllers, then sends the arm to its `home` preset |
+| Laptop | `hardware.launch.py` | `lupin_web` HMI, `slam_toolbox` + `slam_reset_node`, Nav2, `lupin_twin`, mission bundle, Xbox teleop, perception, YOLO, RViz |
+
+<Callout type="info">
+  The vendor `rosbridge_websocket` on the robot keeps running but sits idle, the Lupin HMI talks to the laptop's co-located rosbridge instead, so all JSON encoding stays off the Pi.
+</Callout>
+
+## Robot-side services
+
+All three Lupin units are `PartOf=mirte-ros.service`, so when the vendor service stops or restarts (which respawns its own cameras and controllers) the Lupin units stop and restart with it. Each is `User=mirte`, sources `/opt/ros/humble`, `mirte_ws`, and `ros2_ws`, and runs `Restart=on-failure` with a short `RestartSec`.
+
+### `lupin-onboard.service`
+
+Runs `onboard.launch.py`, which starts four nodes (all `use_sim_time=false`):
+
+- **`twist_mux`**, arbitrates the three command-velocity inputs and remaps `cmd_vel_out` to `/mirte_base_controller/cmd_vel` (the stamped sink the real Mirte's mecanum controller listens on). The arbitration priorities are Xbox dead-man **100**, web HMI joystick **50**, Nav2 smoother **10**, the operator override always wins.
+- **`arm_preset_server`**, serves `/lupin/arm/preset` (named poses: home/tuck/pick/place). `lupin-auto-home` calls it at boot.
+- **`arm_calibrate_server`**, serves `/lupin/arm/calibrate` (Hiwonder zero-offset flow, hardware-only; the underlying bus services exist only on the real Mirte).
+- **`gripper_action_bridge`**, translates `/lupin/gripper/set_angle_with_speed` into a goal on `mirte_master_gripper_controller/gripper_cmd`.
+
+<Callout type="warn">
+  The unit deliberately does **not** set `ProtectSystem=strict`. The vendor FastDDS env script writes its super-client config to a path under `mirte_ws` when sourced; under `ProtectSystem=strict` that write fails read-only and the onboard nodes get a stale DDS config. The comment in `systemd/lupin-onboard.service` records this as a real boot failure that was hit on 2026-05-21.
+</Callout>
+
+### `lupin-cameras.service`
+
+An `ExecStartPre` runs `scripts/kill-vendor-cameras.sh` to release the `/dev/video*` and USB device handles, then `cameras.launch.py` relaunches the cameras from `config/cameras.yaml`:
+
+- The **Orbbec astra** via the vendor `astra.launch.py` with FPS overrides (default color 30 fps at 640×480; depth and point cloud **off** by default, they are the single biggest producer-side CPU drain on the A55 Pi). Point cloud requires depth, so the launch couples them.
+- One **`usb_cam_node_exe`** per auto-detected gripper-camera v4l device (default 20 fps), using the same v4l name filter as the vendor's `gripper_camera.launch.py`.
+
+Relaunched topic names are identical to the vendor's (`/camera/color/image_raw`, `/gripper_camera/image_raw`) so downstream consumers see no interface change.
+
+A robot-side **`web_video_server`** also starts here, bound to `0.0.0.0:8091` with `default_stream_type: ros_compressed`. Running it on the robot keeps the camera-subscriber loop on the same host as the publisher, so only JPEG-encoded MJPEG crosses WiFi, not raw RGB. The Vite `/_video` same-origin proxy in the HMI forwards browser requests to `http://192.168.42.1:8091`.
+
+The unit is sized `MemoryMax=384M` for color@30 (plus depth + point cloud when toggled on).
+
+### `lupin-auto-home.service`
+
+A `Type=oneshot` that runs after `lupin-onboard` is up. It heals controllers stuck by the vendor first-boot race and then drives the arm to its low-load `home` pose via `/lupin/arm/preset`. It is `Restart=on-failure` with `RestartSec=15` and `StartLimitBurst=4`, so if the discovery server or `controller_manager` is slow to settle on a cold boot, a later attempt picks up the heal.
+
+<Callout type="warn">
+  A oneshot that `failed` on a previous boot is **not** auto-retried on the next boot, and does not fire at all on resume-from-suspend (the boot ID does not change). The symptom is several controllers stuck `unconfigured` and the arm never homing. The operator recovery is `post-boot-sync.sh`, which `reset-failed` + `start`s this unit.
+</Callout>
+
+### Installing the robot-side services
+
+The units are not in the stock MIRTE image. Install once per robot image:
+
+```bash
+sudo apt install ros-humble-twist-mux v4l-utils
+
+cd ~/ros2_ws && colcon build --packages-up-to lupin_bringup --symlink-install
+source ~/ros2_ws/install/setup.bash
+
+sudo bash $(ros2 pkg prefix lupin_bringup)/share/lupin_bringup/scripts/install-onboard-systemd.sh
+sudo bash $(ros2 pkg prefix lupin_bringup)/share/lupin_bringup/scripts/install-cameras-systemd.sh
+```
+
+Both install scripts are idempotent and accept `--uninstall`. The onboard installer also installs `lupin-auto-home` alongside (enabled, but not restarted, it only fires on the next boot), adds `mirte` to the `input` group for the Xbox controller, and installs the Xbox-rebind udev rule.
+
+## Laptop-side bring-up
+
+One command brings up everything on top of the robot's onboard services:
+
+```bash
+ros2 launch lupin_bringup hardware.launch.py
+```
+
+Each subsystem is behind a boolean flag, so you can opt in or out without editing files:
+
+| Flag | Default | Brings up |
+| --- | --- | --- |
+| `web` | `true` | `lupin_web`, Vite HTTPS :8090 + `rosbridge_websocket` :9090; video proxied to the robot's :8091 |
+| `slam` | `true` | `slam_toolbox` (owns `/map`, map→odom TF) + `slam_reset_node` (`/lupin/nav/clear_map`) |
+| `nav2` | `true` | Nav2 in slam mode; waits for `/map` and a hot `odom→base_link` TF before activating |
+| `twin` | `true` | `lupin_twin`, aggregates `/floranova/observations` into `/twin/state` |
+| `mission` | `false` | mission bundle: `greenhouse_bridge` oracle + `mission_orchestrator` + one-shot `/amcl_pose` seed |
+| `perception` | `true` | `tag_annotator` + `perception_aggregator` |
+| `yolo` | `true` | torch-based YOLO flower/anomaly detector (laptop-side; needs `ultralytics` + `numpy<2`) |
+| `joystick` | `true` | Xbox teleop (`joy_node` + `teleop_twist_joy` + `arm_teleop`) on the laptop |
+| `discovery_goal` | `5` | number of distinct tags to discover before the monitoring loop |
+| `dependency_timeout_s` | `120.0` | how long the orchestrator waits for Nav2 + bridge before FAULT |
+
+`use_sim_time` is forced `false` throughout. Common invocations:
+
+```bash
+# Default operator mode, HMI + SLAM + Nav2 + twin + RViz.
+ros2 launch lupin_bringup hardware.launch.py
+
+# Headless smoke test, no HMI, no RViz.
+ros2 launch lupin_bringup hardware.launch.py web:=false rviz:=false
+
+# Full mission run.
+ros2 launch lupin_bringup hardware.launch.py mission:=true
+
+# Just the HMI on top of a parked robot.
+ros2 launch lupin_bringup hardware.launch.py slam:=false nav2:=false
+```
+
+The launch prints a clickable HMI URL banner with the auto-detected LAN IP. Open `https://<laptop-ip>:8090` once Vite logs `ready in NNN ms`; accept the self-signed cert once per device.
+
+### Event-driven sentinel cascade
+
+Instead of fixed sleeps, the launch chains tiny `ros2 topic echo --once` sentinels through `OnProcessExit` handlers. Each stage only fires when its subsystem flag is enabled:
+
+```text
+wait_for_scan (/scan) ──▶ slam_toolbox
+                              │
+                              ▼
+wait_for_map (/map) ──▶ wait_for_tf (odom→base_link) ──▶ Nav2 lifecycle
+```
+
+The `slam_toolbox` node is spawned directly (not via `online_async_launch.py`) with `respawn=True`, so the HMI's `/lupin/nav/clear_map` service can SIGTERM it and let it respawn with an empty pose graph. The `wait_for_tf` stage matters on hardware: a cold DDS-over-WiFi `/tf` subscription takes a few seconds to warm up, and Nav2's costmap activation does a single `canTransform()` call that otherwise fails and wedges the lifecycle.
+
+### Self-sourced DDS env
+
+Before anything else, `hardware.launch.py` reads `~/.config/lupin/ros-env.sh` (if present) and applies its `export FOO=bar` lines into its own process environment. This makes the launch self-configuring: whichever terminal you run it from, every child, rosbridge, Nav2, RViz, inherits a consistent DDS-over-WiFi env, even from a terminal opened before the DDS setup script ran. When it applies anything, it prints a banner naming the variables it set.
+
+## Laptop ↔ robot DDS over WiFi
+
+ROS 2's default FastDDS uses UDP multicast for participant discovery, which most WiFi access points (the robot's own AP, university captive portals) silently drop. The symptom: `ssh` and `ping` to the robot work, but `ros2 topic list` from the laptop returns only `/parameter_events` + `/rosout`, and the HMI loads but every panel is blank.
+
+The vendor MIRTE image ships a FastDDS discovery server for exactly this case. The fix is one flag on each side.
+
+<Tabs items={['Simulation','Hardware']}>
+<Tab value='Simulation'>
+
+Simulation runs entirely on one host, so there is no discovery-server setup, all participants are local and multicast works on loopback. The sim entry point is a single launch:
+
+```bash
+ros2 launch lupin_bringup sim_full.launch.py
+```
+
+</Tab>
+<Tab value='Hardware'>
+
+**On the robot**, enable the vendor discovery server, then restart the stack:
+
+```bash
+echo 'export MIRTE_FASTDDS=true' >> /home/mirte/.mirte_settings.sh
+sudo systemctl restart mirte-ros.service lupin-onboard.service lupin-cameras.service
+sudo ss -lnup | grep 11811        # expect a listener on 0.0.0.0:11811 (UDP)
+```
+
+**On the laptop**, run the setup script once. It generates the FastDDS super-client XML, writes the env-loader, and hooks `~/.bashrc`:
+
+```bash
+./lupin_bringup/scripts/setup-laptop-dds-env.sh                  # uses 192.168.42.1
+./lupin_bringup/scripts/setup-laptop-dds-env.sh 10.42.0.42       # custom robot IP
+./lupin_bringup/scripts/setup-laptop-dds-env.sh --uninstall      # back out
+```
+
+Open a fresh shell (or `source ~/.config/lupin/ros-env.sh`), then verify:
+
+```bash
+ros2 daemon start && sleep 5
+ros2 topic list | wc -l                          # expect 50+, not 2
+ros2 topic echo /io/power/power_watcher --once    # should print BatteryState
+```
+
+</Tab>
+</Tabs>
+
+### How the link is wired
+
+`setup-laptop-dds-env.sh` writes `~/.config/lupin/ros-env.sh` with exactly three exports, and nothing else (it is pure, with no side effects, because every new terminal sources it):
+
+```bash
+export FASTRTPS_DEFAULT_PROFILES_FILE="~/.config/lupin/fastdds_super_client.xml"
+export ROS_DISCOVERY_SERVER="<robot-ip>:11811"
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+```
+
+The XML profile declares the laptop participant as a `SUPER_CLIENT` of the robot's discovery server on UDP port `11811`. The robot side never changes, its participants always point at `127.0.0.1:11811`. The default robot IP is `192.168.42.1` (the robot's own AP); pass a different IP when you swap networks.
+
+<Callout type="warn">
+  On Humble's FastDDS 2.6 you need **both** the XML profile and the `ROS_DISCOVERY_SERVER` env var, either alone is flaky. The XML alone does not trigger the discovery-server connection, and the env var alone does not apply SUPER_CLIENT semantics. The setup script wires both into the daemon's environment.
+</Callout>
+
+### Why only MJPEG crosses WiFi
+
+| Port | Where it runs | What it serves |
+| --- | --- | --- |
+| `:9090` | laptop (and idle vendor copy on the robot) | `rosbridge_websocket`, the HMI's ROS connection |
+| `:8090` | laptop | Vite HTTPS, the web HMI itself |
+| `:8091` | robot | `web_video_server`, MJPEG camera streams |
+
+Camera frames are the heaviest payload, so `web_video_server` runs **on the robot**. With `default_stream_type: ros_compressed` it subscribes to the `<topic>/compressed` JPEG companion topics that the cameras already publish, re-emits MJPEG, and the laptop's Vite `/_video` proxy fetches that. Raw RGB never leaves the Pi. An earlier layout that ran `web_video_server` on the laptop pushed every raw frame across the 2.4 GHz AP and produced lag, frame pile-ups, and black screens.
+
+## Clock sync on boot
+
+The Orange Pi 3B has no RTC, and in AP mode it has no NTP source, so it boots with whatever clock it had at shutdown. Clock skew wedges `controller_manager`. `scripts/post-boot-sync.sh` runs on the laptop right after the robot finishes booting and does the whole recovery in one shot:
+
+<Steps>
+<Step>
+**Sync the clock laptop → robot** via SSH `date -s`, then re-check the drift (should be 0 or 1 second).
+</Step>
+<Step>
+**Check the discovery server** is listening (`ss -lnup | grep 11811`).
+</Step>
+<Step>
+**Report the service stack**, `systemctl is-active` for `mirte-ros`, `lupin-onboard`, `lupin-cameras`.
+</Step>
+<Step>
+**Re-fire `lupin-auto-home`**, `reset-failed` then `start`, so a previous boot's failed oneshot heals the controllers this session.
+</Step>
+<Step>
+**List controllers** (expect 5 active), then print the launch command to run.
+</Step>
+</Steps>
+
+Set it up once per laptop as a symlink (so a future `colcon build` of `lupin_bringup` updates it in place):
+
+```bash
+mkdir -p ~/.config/lupin
+ln -s "$(ros2 pkg prefix lupin_bringup)/share/lupin_bringup/scripts/post-boot-sync.sh" \
+      ~/.config/lupin/post-boot-sync.sh
+
+~/.config/lupin/post-boot-sync.sh                       # mirte@192.168.42.1 (default)
+ROBOT=mirte@10.42.0.42 ~/.config/lupin/post-boot-sync.sh
+```
+
+## See also
+
+<Cards>
+  <Card title='Quickstart' href='/docs/quickstart'>One-command bring-up in sim, then point it at the robot.</Card>
+  <Card title='Hardware' href='/docs/hardware'>The MIRTE Master V2 platform, sensors, and quirks.</Card>
+  <Card title='Operations' href='/docs/operations'>The bring-up runbook, failure modes, and recovery.</Card>
+  <Card title='Teleop & manual control' href='/docs/teleop'>The twist_mux arbitration bus and arm presets.</Card>
+</Cards>

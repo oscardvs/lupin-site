@@ -1,0 +1,192 @@
+---
+title: Perception
+description: AprilTag detection with OpenCV ArUco, YOLO flower grading, and an aggregator that fuses both into a discovered-tag registry for the mission and twin.
+---
+
+Lupin's perception stack reads the greenhouse two ways: it locates **AprilTag climate stations** from the Orbbec RGB stream, and it **classifies tulips and pest anomalies** from the gripper camera with YOLO. A third node fuses the two into a single, map-localised, debounced registry that the [mission orchestrator](/docs/mission) and the [digital twin](/docs/digital-twin) consume.
+
+Three nodes, all in `lupin_perception`:
+
+- **`tag_annotator`**, OpenCV-ArUco `36h11` detection, live-`CameraInfo` `solvePnP` pose, one TF per tag, overlay JSON for the HMI. Light enough for the Orange Pi.
+- **`yolo_detector`**, Ultralytics YOLO on the gripper cam, four classes (`tulip_red` / `tulip_white` / `tulip_pink` + `bug`). Heavy (torch); runs laptop/Jetson-side.
+- **`perception_aggregator`**, TF-projects tags into `map`, debounces a discovery registry, temporally co-locates the flower class with the tag being scanned, and serves `/perception/confirm_tag`. Torch-free; runs on the robot.
+
+## AprilTag detection, no `apriltag_ros`
+
+`tag_annotator.py` uses OpenCV's native ArUco detector against the AprilTag `36h11` dictionary (`cv2.aruco.DICT_APRILTAG_36h11`), there is no `apriltag_ros` dependency in the pipeline. That keeps the build small and means the same node runs in Gazebo and on the real robot.
+
+### Runtime API selection (OpenCV 4.6 vs ≥ 4.7)
+
+OpenCV 4.7 reworked the ArUco API. The node picks the right one at runtime so the identical file runs on the dev laptop (≥ 4.7) and the OpenCV-4.6 sim host:
+
+```python
+if hasattr(cv2.aruco, 'ArucoDetector'):
+    self.aruco_params = cv2.aruco.DetectorParameters()
+    _detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
+    self._detect_markers = _detector.detectMarkers
+else:
+    self.aruco_params = cv2.aruco.DetectorParameters_create()
+    self._detect_markers = lambda img: cv2.aruco.detectMarkers(...)
+```
+
+### Live intrinsics + `solvePnP` pose
+
+Intrinsics are never hard-coded. The first `sensor_msgs/CameraInfo` message latches `K` and the (variable-length) distortion `D`; subsequent messages are ignored. Each detected tag's 3-D pose is solved with `cv2.solvePnP` from its four corners and the configured `tag_size_m`, then broadcast as a TF transform:
+
+- **parent frame** = `Image.header.frame_id` verbatim (the driver owns the optical-frame name, e.g. `camera_color_optical_frame`)
+- **child frame** = `f"{tf_frame_prefix}{id}"`, i.e. `tag_<id>`
+- stamped with `Image.header.stamp`
+
+The overlay JSON published on `/camera/tag_detections_json` is an array of `{id, corners: [[x,y]×4], dist}`, where `dist` is the camera-frame z of the tag. An empty array is published for every frame with no tags, which clears the HMI overlay.
+
+### Graceful corners-only degrade
+
+`solvePnP` needs a non-degenerate `K`. The uncalibrated gripper cam ships with `K` all zeros, so the node checks `fx > 0` and `fy > 0` before solving. If intrinsics are missing or zero, it skips pose and TF, still emits corners + id for the HMI box overlay (`dist` is `0.0`), and logs a 30-second-throttled warning. The moment a real calibration lands, pose computation resumes automatically.
+
+<Callout type="info">
+  The `camera_info` subscription is **RELIABLE + VOLATILE** (depth 1) on purpose: a `TRANSIENT_LOCAL` subscriber would reject the Orbbec's VOLATILE per-frame `CameraInfo` (incompatible durability). VOLATILE matches both the Orbbec driver and the gripper `usb_cam`.
+</Callout>
+
+### Configuration
+
+All overridable via launch or `--ros-args`. Defaults from `tag_annotator.py`:
+
+| Parameter | Default | Notes |
+| --- | --- | --- |
+| `image_topic` | `/camera/color/image_raw` | Vendor Orbbec RGB; switch to `/gripper_camera/image_raw` for the wrist cam. |
+| `camera_info_topic` | `/camera/color/camera_info` | Must match `image_topic`. |
+| `detections_topic` | `/camera/tag_detections_json` | What the HMI subscribes to. |
+| `tag_size_m` | `0.04` | Physical edge length of the printed demo tags (4 cm). |
+| `tf_frame_prefix` | `tag_` | Child frame id = `f"{prefix}{id}"`. |
+| `image_qos` | `sensor_data` | BEST_EFFORT, KEEP_LAST(5). Set `reliable` for sim-style profiles. |
+| `use_sim_time` | `false` | The real robot has no `/clock`. |
+
+## YOLO flower detection
+
+`yolo_detector_node.py` subscribes to the gripper camera's compressed stream `/gripper_camera/image_raw/compressed`, decodes each frame with `cv2.imdecode`, and runs Ultralytics YOLO under a `threading.Lock`. It ships a trained model, `best.pt`, installed to `share/lupin_perception/models/best.pt`, with four classes: `tulip_red`, `tulip_white`, `tulip_pink`, and a `bug` anomaly class.
+
+It publishes:
+
+- `yolo/image_detections` (`sensor_msgs/Image`), the annotated frame (`results[0].plot()`), useful in `rqt_image_view`.
+- `yolo/detections` (`std_msgs/String`), a JSON array of `{class, confidence, bbox_xyxy}`, published **only when there is at least one detection**.
+
+Parameters: `model_path` (resolved via `get_package_share_directory`), `conf` (default `0.25`), `imgsz` (default `640`).
+
+<Callout type="warn">
+  **Install gotcha, never `pip install ultralytics` on the robot.** Ultralytics drags in `numpy 2` and `opencv-python`, which shadow the system packages and break `cv_bridge`. The fix is `pip install "numpy<2"` and `pip uninstall opencv-python`. Keep `yolo_detector` (and the aggregator) **laptop/Jetson-side**, only the aggregator's *input* is heavy; the aggregator itself is torch-free.
+</Callout>
+
+## The aggregator, fusion, discovery, confirmation
+
+`perception_aggregator.py` is where two un-correlated 2-D detectors become the located, typed flowers the rest of the stack needs.
+
+### TF-project tags into `map`, debounced
+
+For every tag in the detection JSON, the aggregator looks up `tag_<id>` into the `map` frame and maintains a de-duplicated registry. A tag becomes **discovered** only after `min_sightings` (default **3**) successful map-localised sightings, this debounces a single noisy frame. It keeps the pose from the *closest* view, and detections beyond `max_tag_distance_m` (default **2.5 m**) are counted in-frame but **not pose-committed**, because `solvePnP` error grows with range for a 4 cm tag.
+
+The TF lookup is **zero-timeout by design**:
+
+```python
+tf = self._tf_buffer.lookup_transform(
+    self._map_frame, child, Time(), timeout=Duration(seconds=0.0),
+)
+```
+
+A blocking timeout would deadlock the single-threaded executor that also fills the TF buffer. The detector re-broadcasts each tag TF every frame, so "latest available" is current to within a frame.
+
+### Temporal co-location of species and bug
+
+Because the gripper cam (YOLO's input) is uncalibrated, the aggregator **cannot localise a flower in 3-D**. Association is therefore *temporal*: the dominant tulip species (best confidence over a `yolo_window_s` = 2.0 s window, above `yolo_min_confidence` = 0.35) and the `bug` anomaly flag are attributed to the tag the robot is currently **SCANNING**.
+
+That gate reads `/mission/state`: it attributes only when `lifecycle_state` is `MONITORING` or `INSPECTING` **and** `mission_phase` contains `SCANNING`, targeting `current_target`. Run standalone (no mission), it falls back to the nearest detected tag in the latest frame. While the mission is running but *not* scanning, e.g. `EXPLORING` or driving, it **refuses attribution** to avoid drive-by misassociation.
+
+<Callout type="warn">
+  This temporal co-location is the load-bearing **v1 limitation**: it trusts that whatever the gripper cam sees while parked at tag X belongs to tag X, not a pixel/3-D overlap. The planned refinement projects YOLO boxes through the Orbbec depth stream and aims the arm at the table during scanning.
+</Callout>
+
+### One registry, two consumers
+
+The latched discovery feed and the `confirm_tag` service share the same registry state:
+
+- **`/perception/discovered_tags`** (`lupin_msgs/DiscoveredTags`) is published at `publish_rate_hz` (default **2.0**) with **RELIABLE + TRANSIENT_LOCAL** (depth 1), so a late-subscribing orchestrator instantly sees the whole set. Only entries with `sightings >= min_sightings` and a non-null pose are included. Each `DiscoveredTag` carries `tag_id`, `pose_in_map`, `species`, `species_confidence`, `anomaly`, and `sightings`.
+- **`/perception/confirm_tag`** (`lupin_msgs/srv/ConfirmTag`) is the hardware-only visual-confirmation gate the orchestrator calls before a bridge scan. Given `expected_tag_id`, it returns `detected = true` only when the registry has that tag, it is pose-localised, has `>= min_sightings`, and was last seen within `freshness_s` (default **5.0 s**). Otherwise `detected = false` with an `error_message` of `not discovered`, `below sighting threshold`, or `stale`. `detection_confidence` is `min(1.0, sightings / min_sightings)`.
+
+It also emits **`KIND_FLOWER`** `Observation`s on `/floranova/observations` (the twin's intake, **RELIABLE + TRANSIENT_LOCAL** depth 50) whenever the fused species/anomaly/confidence changes. The embedded `FlowerObservation` carries `tag_id`, the tag's map-frame `pose`, `species`, `confidence`, and `anomaly`; `obs.tag_pose_in_map` is set too, so the twin can pin the flower from either path.
+
+## Topic & service contract
+
+| Interface | Type | Node | Direction |
+| --- | --- | --- | --- |
+| `/camera/color/image_raw` | `sensor_msgs/Image` | `tag_annotator` | in |
+| `/camera/color/camera_info` | `sensor_msgs/CameraInfo` | `tag_annotator` | in |
+| `/camera/tag_detections_json` | `std_msgs/String` | `tag_annotator` → HMI, `perception_aggregator` | out / in |
+| `/tf` | `tf2_msgs/TFMessage` | `tag_annotator` (broadcast), aggregator (listen) | out / in |
+| `/gripper_camera/image_raw/compressed` | `sensor_msgs/CompressedImage` | `yolo_detector` | in |
+| `/yolo/image_detections` | `sensor_msgs/Image` | `yolo_detector` | out |
+| `/yolo/detections` | `std_msgs/String` | `yolo_detector` → aggregator | out / in |
+| `/mission/state` | `lupin_msgs/MissionState` | `perception_aggregator` | in |
+| `/perception/discovered_tags` | `lupin_msgs/DiscoveredTags` | `perception_aggregator` | out (latched) |
+| `/floranova/observations` | `lupin_msgs/Observation` | `perception_aggregator` | out |
+| `/perception/confirm_tag` | `lupin_msgs/srv/ConfirmTag` | `perception_aggregator` | service |
+
+## Running it
+
+<Tabs items={['Simulation','Hardware']}>
+<Tab value='Simulation'>
+
+The AprilTag detector reads the Gazebo camera with RELIABLE QoS and hard-coded-style sim intrinsics:
+
+```bash
+ros2 launch lupin_perception perception.launch.py \
+  image_topic:=/camera/image_raw \
+  image_qos:=reliable \
+  use_sim_time:=true
+```
+
+</Tab>
+<Tab value='Hardware'>
+
+Start the whole stack, AprilTag detector, YOLO detector, and aggregator, from one entry point:
+
+```bash
+ros2 launch lupin_perception perception_stack.launch.py
+```
+
+Or fold it into bring-up: `hardware.launch.py` starts `tag_annotator` + `perception_aggregator` (both light, on the robot) with `perception:=true`, and the heavy `yolo_detector` laptop-side with `yolo:=true`.
+
+</Tab>
+</Tabs>
+
+The gripper cam can also feed the tag detector for in-hand tag tracking:
+
+```bash
+ros2 launch lupin_perception perception.launch.py \
+  image_topic:=/gripper_camera/image_raw \
+  camera_info_topic:=/gripper_camera/camera_info
+```
+
+### Inspecting the pipeline
+
+```bash
+# Camera stack alive?
+ros2 topic hz /camera/color/image_raw
+ros2 topic echo --once /camera/color/camera_info
+
+# Live tag overlay JSON
+ros2 topic echo /camera/tag_detections_json --no-arr
+
+# The discovery registry as the robot explores
+ros2 topic echo /perception/discovered_tags
+
+# A tag TF (transient, only while the tag is in view)
+ros2 run tf2_ros tf2_echo camera_color_optical_frame tag_1
+```
+
+If the HMI shows the feed but never any boxes, check the JSON rate with `ros2 topic hz /camera/tag_detections_json`, zero means the node isn't receiving either the image or `CameraInfo`. The aggregator's fusion (debounce, species, bug flag, `confirm_tag`) is covered by desktop-runnable unit tests that monkeypatch the TF lookup.
+
+<Cards>
+  <Card title="Mission orchestrator" href="/docs/mission">How discovered tags drive exploration and the confirm_tag gate.</Card>
+  <Card title="Digital twin" href="/docs/digital-twin">Where KIND_FLOWER observations land on the map.</Card>
+  <Card title="Interfaces" href="/docs/interfaces">The DiscoveredTags, FlowerObservation, and ConfirmTag contracts.</Card>
+  <Card title="Hardware" href="/docs/hardware">The Orbbec and gripper cameras behind these streams.</Card>
+</Cards>
