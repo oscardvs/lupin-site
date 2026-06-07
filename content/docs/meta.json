@@ -5,9 +5,11 @@
     "index",
     "quickstart",
     "architecture",
+    "design-decisions",
     "hardware",
     "---The stack---",
     "navigation",
+    "simulation",
     "mission",
     "perception",
     "digital-twin",
@@ -19,6 +21,7 @@
     "operations",
     "networking",
     "---Project---",
+    "war-stories",
     "demos"
   ]
 }

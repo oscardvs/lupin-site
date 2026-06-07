@@ -1,35 +1,116 @@
 ---
 title: Hardware
-description: The MIRTE Master V2 platform behind Lupin, holonomic mecanum base, 4-DOF arm, depth and gripper cameras, lidar, and split robot/laptop compute.
+description: The MIRTE Master V2 platform behind Lupin, the PCA9685-driven holonomic mecanum base with quadrature wheel encoders and a per-wheel velocity PID, the 5-servo Hiwonder TTL arm with AS5600 absolute encoders and a wrist-mounted gripper camera, the Astra Mini Pro depth cam, USB gripper cam, RPLidar C1, MPU9250 IMU and INA226 power monitor, the twist_mux command bus, the gripper_action_bridge command path, the estop_bridge safety wiring, the BRG status LED strip, and the auto_home boot controller-heal.
 ---
 
-Lupin runs on the **MIRTE Master V2**: a holonomic 4-wheel mecanum base with a 4-DOF arm and a 1-DOF gripper, driven by ROS 2 Humble. The base, arm, sensors, and onboard compute are vendor hardware; Lupin layers its own `ros2_control` healing, a producer-side camera pipeline, and a robot/laptop compute split on top. This page covers what is physically on the robot and the exact topics it speaks.
+Lupin runs on the **MIRTE Master V2**: a holonomic 4-wheel mecanum base with a 4-DOF arm, a 1-DOF gripper, two cameras, a lidar, and an Orange Pi for compute, all driven by ROS 2 Humble. The base, arm, servos, sensors, and onboard compute are vendor hardware; Lupin layers its own `ros2_control` healing, a producer-side camera pipeline, a `twist_mux` command bus, and a robot/laptop compute split on top. This page is the reference for what is physically on the robot, which bus each component hangs off, and the exact topics it speaks.
+
+<Figure src="/photos/mirte-master-annotated.jpg" caption="MIRTE Master V2 with callouts: 4 mecanum wheels, 5-servo Hiwonder arm, wrist-mounted gripper camera, Astra Mini Pro depth cam, RPLidar C1, Orange Pi compute, emergency button, status LED strip." />
 
 <Callout type="info">
-  Figures here come from two sources. Anything about the **chassis, arm, servos, sensors, and onboard compute** is the MIRTE Master vendor platform (see the [MIRTE docs](https://docs.mirte.org/develop/index.html)). Anything about **FPS, ports, controller-healing, the command bus, and topic remaps** comes from the Lupin configs in `lupin_bringup` and `lupin_hmi` and is cited to those files. Where the two differ, the Lupin config wins on the real robot.
+  Figures here come from two sources. Anything about the **chassis, arm, servos, sensors, and onboard compute** is the MIRTE Master vendor platform (see the [MIRTE docs](https://docs.mirte.org/develop/index.html)). Anything about **FPS, ports, controller-healing, the command bus, the e-stop wiring, and topic remaps** comes from the Lupin configs in `lupin_bringup` and `lupin_hmi` and is cited to those files. Where the two differ, the Lupin config wins on the real robot.
 </Callout>
+
+## Hardware inventory
+
+Everything on the robot hangs off one of four buses: the `I2C1` line carries the slow-but-clever chips (the `PCA9685` motor driver, the `INA226` power monitor, the `MPU9250` IMU, and the arm's `AS5600` absolute encoders behind a mux), a single Hiwonder **TTL serial bus** carries the five arm servos, GPIO pins read the four quadrature wheel encoders, and USB carries the lidar and both cameras. The diagram below is the wiring reality the flat sensor tables hide.
+
+<Mermaid chart={`erDiagram
+  I2C1 ||--o{ PCA9685 : "0x41"
+  I2C1 ||--o{ INA226 : "0x40"
+  I2C1 ||--o{ MPU9250 : "imu"
+  I2C1 ||--o{ AS5600mux : "0x36"
+  PCA9685 {
+    string drives "4 mecanum motors"
+  }
+  INA226 {
+    string topic "/io/power/power_watcher"
+  }
+  MPU9250 {
+    string topic "/io/imu/movement/data"
+  }
+  AS5600mux {
+    string encoders "5 arm joints mux0-4"
+  }
+  HiwonderTTL ||--o{ ArmServos : "rx0 tx1"
+  ArmServos {
+    string ids "shoulder_pan2 lift3 elbow4 wrist5 gripper6"
+  }
+  GPIO ||--o{ WheelEncoders : "quadrature"
+  WheelEncoders {
+    string topic "/mirte_base_controller/odom"
+  }
+  USB ||--o{ RPLidarC1 : "serial"
+  RPLidarC1 {
+    string topic "/scan"
+  }
+  USB ||--o{ AstraMiniPro : "depth cam"
+  AstraMiniPro {
+    string topic "/camera/color/image_raw"
+  }
+  USB ||--o{ GripperCam : "usb_cam"
+  GripperCam {
+    string topic "/gripper_camera/image_raw"
+  }
+  NeopixelStrip {
+    string order "BRG status"
+  }
+`} />
 
 ## The base, holonomic 4-mecanum drive
 
 The MIRTE Master V2 is a **mecanum** platform: four independently driven wheels let it translate sideways and rotate in place, not just drive-and-turn. Lupin treats this as a first-class capability rather than constraining it to a differential model, the whole navigation and arbitration stack is built for an omnidirectional base.
 
-- Wheel-encoder odometry is published on `/mirte_base_controller/odom` (`nav_msgs/msg/Odometry`). This is the same topic in sim and on hardware, and it is what Nav2's `bt_navigator`, `controller_server`, and `velocity_smoother` consume as their `odom_topic`.
-- The base frame is `base_link` everywhere, the MIRTE URDF publishes no `base_footprint`, so AMCL, both costmaps, and slam_toolbox are all configured against `base_link`.
-- The drive sink differs by deployment: the real Mirte's mecanum controller listens on `/mirte_base_controller/cmd_vel` (`geometry_msgs/Twist`), while sim uses `/mirte_base_controller/cmd_vel_unstamped`.
+Underneath the topics is a short, specific drivetrain. A `PCA9685` 16-channel PWM driver at I2C address `0x41` (config `motorservocontroller`) drives the four mecanum motors; four **quadrature wheel encoders** on GPIO feed back actual wheel rotation; and a two-stage `ros2_control` chain turns one `Twist` into four wheel velocities. The first stage is `clearpath_mecanum_drive_controller/MecanumDriveController` (`mirte_base_controller`), which decomposes the body velocity using `wheels_radius: 0.051` m and `sum_of_robot_center_projection_on_X_Y_axis: 0.225` m (that is `0.18/2 + 0.27/2`, the wheel separations halved and summed). The second stage is a per-wheel `pid_controller/PidController` (`pid_wheels_controller`) with gains `p: 1.5, i: 0.5, d: 0.01`, antiwindup on, and an `i_clamp` of `±15`, closing the loop on each wheel's measured velocity before the PWM hits the motor. The whole `controller_manager` runs at `update_rate: 10` Hz (`mirte_base_control.yaml`), which is why every command and re-assert tick on this robot is a 100 ms beat, not a kilohertz one.
+
+- **Wheel-encoder odometry** publishes on `/mirte_base_controller/odom` (`nav_msgs/msg/Odometry`). This is the same topic in sim and on hardware, and it is what Nav2's `bt_navigator`, `controller_server`, and `velocity_smoother` consume as their `odom_topic`.
+- **The base frame** is `base_link` everywhere, the MIRTE URDF publishes no `base_footprint`, so AMCL, both costmaps, and slam_toolbox are all configured against `base_link`.
+- **The drive sink** differs by deployment: the real Mirte's mecanum controller listens on `/mirte_base_controller/cmd_vel` (`geometry_msgs/Twist`), while sim uses `/mirte_base_controller/cmd_vel_unstamped` (`use_stamped_vel: false`). The unstamped topic does **not** exist on hardware, which is the single most common sim-to-hardware drive trap, see [navigation](/docs/navigation).
+
+The `Omni` motion model Nav2 uses is not a tuning preference, it falls straight out of this kinematic decomposition: a `Twist` with non-zero `linear.y` is feasible because each wheel takes a different signed speed, so the [navigation](/docs/navigation) controller is allowed to command strafes a differential base could never execute.
 
 <Callout type="warn">
-  Velocity commands are published **BEST_EFFORT**. Both the sim `twist_mux` and the real mecanum controller subscribe BEST_EFFORT, a RELIABLE publisher silently drops every message on the QoS mismatch (`lupin_hmi/cmd_vel_mux.py`). Any new chassis publisher must match.
+  Velocity commands are published **BEST_EFFORT**. Both the sim `twist_mux` and the real mecanum controller subscribe BEST_EFFORT, a RELIABLE publisher silently drops every message on the QoS mismatch. Any new chassis publisher must match.
 </Callout>
 
 ## The arm, 4-DOF + 1-DOF gripper
 
-The arm is a 4-DOF serial chain of Hiwonder serial-bus servos plus a 1-DOF gripper jaw. Lupin commands all four arm joints together as a single trajectory and the gripper as an action.
+The arm is a serial chain of **five Hiwonder serial-bus servos** sharing one TTL bus (`servo_controller`, `rx: 0` / `tx: 1` in `mirte_master_config.yaml`): IDs 2-6 are `shoulder_pan`, `shoulder_lift`, `elbow`, `wrist`, and `gripper`. Each joint carries an `AS5600` magnetic **absolute encoder** read over I2C through a 5-channel mux (`as5600_M` at `0x36`, mux channels 0-4), so the firmware always knows the true joint angle even after a power-cycle. The `wrist` servo does double duty: the gripper camera is rigidly bolted to the `wrist` link (`gripper_camera_joint` in `arm.xacro`, pitched ~0.40 rad down), so moving the wrist *is* the camera-tilt mechanism, there is no separate pan-tilt motor.
+
+Lupin commands all four arm joints together as a single trajectory and the gripper as an action:
 
 - **Arm joint order**, used by every Lupin arm publisher: `shoulder_pan_joint`, `shoulder_lift_joint`, `elbow_joint`, `wrist_joint`.
-- Arm commands go to `/mirte_master_arm_controller/joint_trajectory` (`trajectory_msgs/JointTrajectory`); each joint is clamped to ±π/2 rad.
-- The gripper is driven by a `control_msgs/action/GripperCommand` action on `/mirte_master_gripper_controller/gripper_cmd`. The URDF `gripper_joint` range is `[-0.20, 0.25]` rad with `max_effort 2.0`.
+- **Arm commands** go to `/mirte_master_arm_controller/joint_trajectory` (`trajectory_msgs/JointTrajectory`), driving a `joint_trajectory_controller/JointTrajectoryController`. Each joint is clamped to an **asymmetric per-joint window** (next section), not a blanket `±π/2`.
+- **The gripper** is a separate `position_controllers/GripperActionController` (`mirte_master_arm_controller.yaml`), driven by a `control_msgs/action/GripperCommand` goal on `/mirte_master_gripper_controller/gripper_cmd`. The URDF `gripper_joint` range is `[-0.20, 0.25]` rad with `max_effort 2.0`.
 
-Named poses live in `arm_preset_server` and are reachable via `/lupin/arm/preset` (`lupin_msgs/srv/SetArmPreset`). The five static presets (radians, in joint order) are:
+A surprise worth stating: the gripper shares the **same** `ros2_control` hardware plugin as the arm, `mirte_master_arm_control/MirteMasterArmHWInterface` (`ros2_control.xacro`). It is not a separate driver. That is why the dead-band re-assert behaviour described below applies to the jaw exactly as it does to the four arm joints.
+
+### Joint limits and gripper direction
+
+The blanket `±π/2` clamp the early docs claimed was **replaced**. The real per-joint command windows are the intersection of each servo's raw Hiwonder software limit (converted from raw counts in `mirte_master_config.yaml`) with the `±90°` URDF envelope, rounded inward so Lupin never commands a pose the servo silently rejects (`lupin_hmi/arm_limits.py`). This `arm_limits.py` module is the single source of truth, mirrored degree-for-degree into the frontend `arm.ts`, so the HMI, the preset server, the teleop node, and the bridge all clamp identically.
+
+| Joint | Command window | Why this bound |
+| --- | --- | --- |
+| `shoulder_pan` | `[-86°, +90°]` | Servo stops at +90° but only reaches -86° |
+| `shoulder_lift` | `[-86°, +85°]` | Both ends tighter than 90° at the servo |
+| `elbow` | `[-90°, +90°]` | Servo reaches past 90°, kept at the URDF envelope |
+| `wrist` | `[-90°, +88°]` | -90° conservative, +88° is the servo stop |
+
+<Callout type="warn">
+  **Gripper direction is inverted on Mirte-247264.** HMI `-30°` maps to **OPEN** and `+30°` to **CLOSED**, the reverse of intuition (`arm_limits.py`). Any semantic open/close consumer must use that sign convention. The `±30°` window itself is a conservative guess (`GRIPPER_RANGE_UNVERIFIED = True`): the servo physically reaches roughly `-43.6°..+37°`, so the window is pending a live `GetServoRange` tuning pass before it is widened.
+</Callout>
+
+### The dead-band re-assert mechanism
+
+This is the deepest *why* on the page, and it explains three otherwise-baffling behaviours: why a raw servo write snaps back, why a sagging joint suddenly re-commands itself, and why the gripper needs a startup-pin. The vendor `MirteMasterArmHWInterface::write` loop (running at the 10 Hz `controller_manager` rate) only re-sends a joint's `set_angle` service call when one of two dead-bands is exceeded: `SERVO_COMMAND_DIFF = 0.05` rad (~2.9°, the controller's commanded angle changed) **or** `SERVO_MOVED_DIFF = 0.05` rad (the measured position drifted that far since the joint last moved). The consequences fall out directly:
+
+- **Raw `set_angle` writes get overwritten**, because the HW interface re-asserts the controller's last commanded angle the next tick the drift dead-band trips. Always go through the controller, never the raw `/io/servo/.../set_angle` service.
+- **Gravity sag self-corrects**, because a joint that droops past 0.05 rad trips the moved dead-band and gets re-commanded back toward its setpoint.
+- **The gripper needs a startup-pin**, because on first power-up the controller's internal setpoint is ~0 while the jaw is wherever it physically rests, so without a one-shot trajectory holding the live pose the dead-band would yank the jaw to 0 the moment a subscriber appears.
+
+### Named presets
+
+Named poses live in `arm_preset_server` and are reachable via `/lupin/arm/preset` (`lupin_msgs/srv/SetArmPreset`). There are **six** presets (radians, in joint order):
 
 | Preset | shoulder_pan | shoulder_lift | elbow | wrist | Notes |
 | --- | --- | --- | --- | --- | --- |
@@ -38,14 +119,19 @@ Named poses live in `arm_preset_server` and are reachable via `/lupin/arm/preset
 | `tuck` | 0 | -1.40 | 1.40 | 0 | Folded for travel |
 | `pick` | 0 | -0.60 | 0.80 | -0.40 | Reach-down |
 | `place` | 0 | 0.20 | 0.80 | -0.40 | Reach-forward |
+| `inspect` | 0 | -0.40 | 0.90 | -0.80 | Per-pot patrol pose; pitches the wrist camera down into the pot for the flower detector |
+
+The `inspect` pose is load-bearing for the mission: it is the per-pot patrol stance that aims the wrist-mounted gripper camera down at the bloom so the [perception](/docs/perception) flower detector gets a top-down frame.
 
 <Callout type="warn">
-  The Hiwonder `shoulder_lift` servo will latch into a thermal trip if it is held against gravity, only a power-cycle clears it. The `home` pose is the measured minimum-gravity-moment rest pose for exactly this reason, and the boot-time `auto_home` one-shot parks the arm there as soon as the controllers are up.
+  The Hiwonder `shoulder_lift` servo (an `LX`-series unit) will **trip** if it is held against gravity. Lifting the arm it stalls below the 5 A config cap, pulls current with zero motion, and either unloads (torque drops, the joint goes back-drivable, the arm sags) or, in the older failure mode, latches with commands ignored entirely while the encoder still reports position. An unloaded servo re-loads with `/io/servo/hiwonder/shoulder_lift/set_enable true`; a full thermal latch needs a hard power-cycle, no `systemctl restart mirte-ros` clears it. The `home` pose is the measured minimum-gravity-moment rest pose chosen for exactly this, and the boot-time `auto_home` one-shot parks the arm there as soon as the controllers are up. Never park the arm extended between sessions.
 </Callout>
 
-### The vendor first-boot controller wedge
+<Figure src="/photos/arm-home-vs-extended.jpg" caption="Left: the measured home rest pose (minimum gravity moment on shoulder_lift). Right: an extended pose that thermally trips the lift servo if held. Why auto_home parks the arm on boot." />
 
-On a cold boot the vendor `ros2_control` spawner races itself and some controllers come up unconfigured or missing. Lupin closes this with a boot-time one-shot (`lupin_hmi/auto_home.py`, run by `lupin-auto-home.service`) that heals **five** controllers to `active` before homing the arm:
+## The boot controller-heal
+
+On a cold boot the vendor `ros2_control` stack **races** itself: `ros2_control_node`'s YAML auto-load runs against three separate spawners (`state_publishers.launch.py`, `mirte_base.launch.py`, `mirte_master_arm_control.launch.py`). When the race fires, a controller ends up `unconfigured` (loaded but `configure()` never ran), `inactive` (configured but `switch()` never ran), or missing entirely (the spawner FATALd and the controller never loaded). Lupin closes this with a boot-time one-shot (`lupin_hmi/auto_home.py`, run by `lupin-auto-home.service`) that heals **five** controllers to `active` before homing the arm:
 
 ```text
 joint_state_broadcaster
@@ -55,44 +141,103 @@ mirte_master_gripper_controller
 mirte_base_controller
 ```
 
-It lists controllers via `/controller_manager/list_controllers`, then `LoadController` for missing, `ConfigureController` for unconfigured, and `SwitchController` for inactive ones, handling each state explicitly. If controller state is unverifiable it exits 0, so a failed heal never spins `Restart=on-failure`. Opt out with `LUPIN_AUTO_HOME=false`.
+`heal_controllers` returns a deliberate **tri-state**, and the third value is the load-bearing one. `True` means all five reached `active` (home the arm). `False` means `list_controllers` worked but not all targets ended `active`, so `main()` exits 1 and `systemd` retries. `None` means `list_controllers` never returned valid data inside the poll budget, so the loaded state is unknown; blindly issuing `LoadController` then `SwitchController` against an unknown stack is exactly what caused the 2026-05-27 retry storm (every load returned "already loaded", every switch failed, `Restart=on-failure` spun). In that case `main()` exits **0** on purpose so `systemd` does not retry, and the operator re-triggers via `post-boot-sync.sh`.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> WaitCM
+  WaitCM --> Poll : "controller_manager up"
+  WaitCM --> RetNone : "unreachable / no valid list"
+  Poll --> Heal : "states visible"
+  Poll --> RetNone : "poll budget burned"
+  Heal --> Configure : "unconfigured"
+  Heal --> Activate : "inactive"
+  Heal --> Load : "missing"
+  Load --> Configure
+  Configure --> Activate
+  Activate --> Check
+  Check --> RetTrue : "all five active"
+  Check --> RetFalse : "not all active"
+  RetTrue --> HomeArm
+  RetFalse --> [*] : "exit 1 systemd retries"
+  RetNone --> [*] : "exit 0 no retry run post-boot-sync"
+  HomeArm --> [*]
+`} />
+
+Opt out of the whole heal with `LUPIN_AUTO_HOME=false`. The behaviour of every controller name above, plus the failure modes that mimic a wedge, are in [operations](/docs/operations) and the [war stories](/docs/war-stories).
 
 ## Sensors
 
 | Sensor | Topic(s) | Type | Notes |
 | --- | --- | --- | --- |
-| Orbbec Astra (depth cam) | `/camera/color/image_raw` (+ `/compressed`) | `sensor_msgs/msg/Image` | Color stream; the HMI / AprilTag feed |
-| Orbbec Astra, depth | `/camera/depth/image_raw` | `sensor_msgs/msg/Image` | Disabled by default on hardware (CPU); on for grasp/perception research |
-| Orbbec Astra, pointcloud | `/camera/depth/points` | point cloud | Off by default; **requires depth** (coupled at the driver) |
-| USB gripper camera | `/gripper_camera/image_raw` (+ `/compressed`) | `sensor_msgs/msg/Image` | `usb_cam`, mounted on the arm for tag/flower aim |
-| RPLidar (A1) | `/scan` | `sensor_msgs/msg/LaserScan` | Laser source for AMCL, slam_toolbox, and both costmaps |
-| IMU |, |, | Vendor onboard IMU |
+| Astra Mini Pro (color) | `/camera/color/image_raw` (+ `/compressed`) | `sensor_msgs/msg/Image` | Color stream; the HMI / AprilTag feed |
+| Astra Mini Pro (depth) | `/camera/depth/image_raw` | `sensor_msgs/msg/Image` | Disabled by default on hardware (CPU); on for grasp/perception research |
+| Astra Mini Pro (pointcloud) | `/camera/depth/points` | point cloud | Off by default; **requires depth** (coupled at the driver) |
+| USB gripper camera | `/gripper_camera/image_raw` (+ `/compressed`) | `sensor_msgs/msg/Image` | `usb_cam`, on the wrist link for tag/flower aim |
+| RPLidar C1 | `/scan` | `sensor_msgs/msg/LaserScan` | Laser source for AMCL, slam_toolbox, and both costmaps |
+| MPU9250 IMU | `/io/imu/movement/data` | `sensor_msgs/msg/Imu` | Vendor onboard 9-axis IMU |
+| INA226 power monitor | `/io/power/power_watcher` | power state | Battery voltage / current / percentage |
 | Wheel-encoder odometry | `/mirte_base_controller/odom` | `nav_msgs/msg/Odometry` | Same topic sim and hardware |
 
 <Callout type="info">
-  Lidar returns below **0.25 m** are filtered out everywhere (AMCL `laser_min_range`, slam_toolbox, costmap `obstacle_layer`) because closer hits are the robot's own gripper and arm, not obstacles. The `laser_max_range` of 12 m matches the RPLidar A1's effective max (`lupin_navigation/config/nav2_params.yaml`).
+  The lidar is an **RPLidar C1**, not an A1, the vendor `minimal_master.launch.py` includes `rplidar_ros/rplidar_c1_launch.py` (`frame_id: laser`, baudrate 460800, Standard scan mode). Lidar returns below **0.25 m** are filtered out everywhere (AMCL `laser_min_range`, slam_toolbox, costmap `obstacle_layer`) because closer hits are the robot's own gripper and arm, not obstacles. The `laser_max_range` of 12 m matches the C1's effective max (`lupin_navigation/config/nav2_params.yaml`).
 </Callout>
 
-The Astra color sensor only offers 10/15/30 fps at 640×480 (and 7 fps at 1280×960); Lupin runs it at **30 fps / 640×480** for a smooth HMI feed. The depth profiles map 1:1 onto the color profiles on this device. See `lupin_bringup/config/cameras.yaml`.
+The `INA226` power monitor (`power_watcher`) is wired with `min_voltage: 11.1` V, `max_voltage: 15.0` V, `max_current: 5.0` A, a `turn_off_time` of 10 s and `power_low_time` of 20 s, and it drives a percentage LED on `GPIO4_B4`. Battery-low is what flips the status strip and the HMI battery pill, see [web-hmi](/docs/web-hmi). The `Astra Mini Pro` color sensor only offers 10/15/30 fps at 640×480 (and 7 fps at 1280×960); Lupin runs color at **30 fps / 640×480** (`cameras.yaml`).
+
+<Callout type="warn">
+  **The status LED strip is wired BRG.** Mirte-247264's addressable neopixel strip transmits byte slot 0 as blue, slot 1 as red, slot 2 as green. The vendor's documented `data_order` fix targets the old Python telemetrix and is a silent no-op in the C++ `neopixel.cpp`, which sends `{r, g, b}` straight through with no reorder knob. Lupin compensates at the one chokepoint every LED write passes, the `color_order: 'BRG'` param on `light_strip_bridge` (`onboard.launch.py`). It is a launch param, relaunch and you are done, no telemetrix edit.
+</Callout>
 
 ## Compute, robot + laptop split
 
-Lupin deliberately splits its runtime across two machines:
+Lupin deliberately splits its runtime across two machines, and the deep point is how *little* crosses the link: only DDS metatraffic and a single MJPEG stream go over WiFi, everything raw stays on its own host.
 
 - **Onboard**, an Orange Pi (4-core Cortex-A55) runs the vendor `mirte-ros.service` (telemetrix, controllers, lidar, cameras, rosbridge on `:9090`) plus three Lupin systemd units that keep manual control alive the moment the robot boots, with no laptop launch needed.
 - **Laptop**, a single `ros2 launch lupin_bringup hardware.launch.py` brings up the heavy stack: the web HMI, slam_toolbox, Nav2, the digital twin, perception, the YOLO detector, and RViz. See [networking](/docs/networking) and [operations](/docs/operations).
 
+<Mermaid chart={`flowchart LR
+  subgraph Robot["Onboard Orange Pi"]
+    MR["mirte-ros.service<br/>telemetrix · controllers · lidar"]
+    ON["lupin-onboard<br/>twist_mux · bridges · estop"]
+    CAM["lupin-cameras<br/>low-FPS drivers"]
+    WVS["web_video_server :8091<br/>JPEG to MJPEG"]
+    RB["rosbridge :9090"]
+    CAM --> WVS
+  end
+  subgraph Laptop["Laptop hardware.launch.py"]
+    HMI["Web HMI"]
+    NAV["SLAM · Nav2 · twin"]
+    PER["perception · YOLO · RViz"]
+  end
+  WVS -->|MJPEG over WiFi| HMI
+  RB -->|"DDS / WS"| HMI
+  ON -->|"DDS"| NAV
+  MR -->|"DDS"| PER
+`} />
+
 ### Onboard Lupin services
+
+`lupin-onboard.service` starts **six** nodes (`onboard.launch.py`), not the four older docs listed, two of which are easy to miss and both significant:
+
+| Node | Brings up |
+| --- | --- |
+| `twist_mux` | Arbitrates the three velocity sources onto the drive topic |
+| `arm_preset_server` | `/lupin/arm/preset` named-pose service |
+| `arm_calibrate_server` | `/lupin/arm/calibrate` zero-offset calibration |
+| `gripper_action_bridge` | HMI/voice gripper angle to `GripperCommand` action |
+| `light_strip_bridge` | Mission-state status LED, BRG color remap |
+| `estop_bridge` | Physical e-stop button to `/e_stop_state` |
+
+The two service units around it:
 
 | Service | Brings up |
 | --- | --- |
-| `lupin-onboard.service` | `twist_mux`, `arm_preset_server`, `arm_calibrate_server`, `gripper_action_bridge` (`lupin_bringup/launch/onboard.launch.py`) |
-| `lupin-cameras.service` | Kills vendor cameras, relaunches Orbbec + gripper cams at low FPS + a robot-side `web_video_server` (`cameras.launch.py`) |
+| `lupin-cameras.service` | Kills vendor cameras, relaunches Astra + gripper cams at low FPS + a robot-side `web_video_server` (`cameras.launch.py`) |
 | `lupin-auto-home.service` | One-shot controller heal + arm `home` (`lupin_hmi/auto_home.py`) |
 
 ### Producer-side camera pipeline
 
-The vendor cameras run at native rate regardless of subscribers, on the 4-core A55 the two camera producers alone consume roughly 85% of one core. Rather than throttle downstream, `lupin-cameras.service` kills the vendor camera processes (`ExecStartPre`, `scripts/kill-vendor-cameras.sh`) and relaunches the Orbbec and `usb_cam` drivers at config-driven low FPS, on the **identical vendor topic names** so downstream consumers (HMI, AprilTag detector, `web_video_server`) see no interface change. The measured win (`cameras.launch.py` docstring):
+The vendor cameras run at native rate regardless of subscribers, on the 4-core A55 the two camera producers alone consume roughly 85% of one core. Rather than throttle downstream, `lupin-cameras.service` kills the vendor camera processes (`ExecStartPre`, `scripts/kill-vendor-cameras.sh`) and relaunches the drivers at config-driven low FPS, on the **identical vendor topic names** so downstream consumers (HMI, AprilTag detector, `web_video_server`) see no interface change. Two details matter: the vendor uses the `astra_camera` package's `astra_pro_plus.launch.xml`, while `lupin-cameras` swaps in the `orbbec_camera` package's `astra.launch.py` driver at the lower FPS, and the measured win (`cameras.launch.py` docstring) is:
 
 ```text
 usb_cam_node_exe            ~31% → ~5%
@@ -117,7 +262,7 @@ web_video_server:
 `default_stream_type: ros_compressed` is the load-bearing setting, it makes the server subscribe to `<topic>/compressed` (`sensor_msgs/CompressedImage`, pre-encoded JPEG from `image_transport`) rather than raw `<topic>`, so the Pi just forwards cheap JPEG-in / MJPEG-out. The laptop's Vite `/_video` proxy reaches the robot directly at `http://192.168.42.1:8091`.
 
 <Callout type="warn">
-  The earlier layout ran `web_video_server` on the laptop, which forced every raw frame across WiFi, roughly 220 Mbps offered against ~60 Mbps usable on the 2.4 GHz Mirte AP, producing lag, frame pile-ups, and the occasional black screen. The fix is purely *where* the encoder runs, not a network change.
+  The earlier layout ran `web_video_server` on the laptop, which forced every raw frame across WiFi. The arithmetic is why that hurt: 640×480 RGB at 30 fps is roughly 220 Mbps offered against ~60 Mbps usable on the 2.4 GHz Mirte AP, so frames piled up, lagged, and occasionally went black. With `ros_compressed` the same feed is JPEG ≈ 50 kB × 30 fps ≈ 12 Mbps, comfortable on the AP. The fix is purely *where* the encoder runs, not a network change.
 </Callout>
 
 ## The chassis command bus
@@ -130,24 +275,89 @@ Three velocity sources feed the base through a single `twist_mux`, arbitrated by
 | Remote operator | `/cmd_vel_manual` | 50 | 0.5 s | Web HMI joystick widget |
 | Autonomy | `/cmd_vel_auto` | 10 | 0.5 s | Nav2 `velocity_smoother` |
 
-The mux output is remapped to `/mirte_base_controller/cmd_vel` on hardware. Nav2 never publishes to the drive topic directly, its `velocity_smoother` emits to `/cmd_vel_auto` so autonomy goes through the exact same arbitration as a human operator, and a held dead-man instantly preempts it. See [teleop](/docs/teleop).
+<Mermaid chart={`flowchart LR
+  JOY["/cmd_vel_joy<br/>prio 100 · 0.3s"]
+  MAN["/cmd_vel_manual<br/>prio 50 · 0.5s"]
+  AUTO["/cmd_vel_auto<br/>prio 10 · 0.5s"]
+  MUX["twist_mux"]
+  CTRL["/mirte_base_controller/cmd_vel"]
+  MEC["MecanumDriveController"]
+  PID["pid_wheels_controller"]
+  PCA["PCA9685"]
+  MOT["4 mecanum motors"]
+  JOY -->|BEST_EFFORT| MUX
+  MAN -->|BEST_EFFORT| MUX
+  AUTO -->|BEST_EFFORT| MUX
+  MUX --> CTRL --> MEC --> PID --> PCA --> MOT
+`} />
+
+The mux output is remapped to `/mirte_base_controller/cmd_vel` on hardware. Nav2 never publishes to the drive topic directly, its `velocity_smoother` emits to `/cmd_vel_auto` so autonomy goes through the **exact same arbitration** as a human operator, and a held dead-man instantly preempts it. See [teleop](/docs/teleop).
 
 <Callout type="info">
   Xbox gamepad teleop lives on the **laptop**, not the robot. The onboard `joy_node` path was removed because BLE pad pairing on this Orange Pi image (BlueZ 5.64 + Xbox Series X|S firmware) is fragile and the respawn race added boot-time complexity for no gain over plugging the pad into the laptop. The web HMI still drives the robot with no laptop launch, just no joystick option.
 </Callout>
 
+## The physical e-stop
+
+Until recently the autonomous e-stop was decorative. The orchestrator's `EStopMonitor` subscribes to `/e_stop_state` (`std_msgs/Bool`), but **nothing in production published it**, a whole-tree grep found only the unit-test fixture. The real button publishes `/io/intensity/emergency_button/digital` (`mirte_msgs/IntensityDigital`, not `Bool`) with zero subscribers, and the HMI STOP was a client-side `cmd_vel`-zeroing gate, so pressing either never froze the mission state machine or cancelled an in-flight Nav2 goal.
+
+`lupin_hmi/estop_bridge` (in `onboard.launch.py`) closes the seam: it subscribes the physical button **and** the HMI soft-stop `/lupin/hmi/estop`, ORs them, and publishes the result onto `/e_stop_state` at 5 Hz, staying the single publisher so a late-joining (VOLATILE) orchestrator always converges.
+
+<Callout type="error">
+  The button polarity (`engaged_value`) is **not yet hardware-verified**. The bridge logs the assumed polarity loudly at startup precisely because it must be confirmed: press the physical button and check `/e_stop_state` goes `true`; if it does not, flip the `engaged_value` launch param. A safety interlock is only real if pressing the button actually freezes the mission.
+</Callout>
+
 ## Gripper command path
 
-HMI and voice gripper commands do **not** call the raw Hiwonder servo service. They go through `/lupin/gripper/set_angle_with_speed` (`mirte_msgs/srv/SetServoAngleWithSpeed`) into `gripper_action_bridge`, which maps the HMI angle linearly onto the URDF `[-0.20, 0.25]` rad range and sends a `GripperCommand` action goal on `/mirte_master_gripper_controller/gripper_cmd`. Shortcutting to the raw servo service fights the `GripperActionController` and re-asserts a stale setpoint.
+HMI and voice gripper commands do **not** call the raw Hiwonder servo service. They go through `/lupin/gripper/set_angle_with_speed` (`mirte_msgs/srv/SetServoAngleWithSpeed`) into `gripper_action_bridge`, which clamps and maps the HMI angle onto the URDF `[-0.20, 0.25]` rad range (via the shared `arm_limits`) and sends a `GripperCommand` action goal on `/mirte_master_gripper_controller/gripper_cmd`. Shortcutting to the raw servo service fights the `GripperActionController` and re-asserts a stale setpoint, the dead-band mechanism described above snaps the jaw right back.
 
-On its first complete `/joint_states`, the bridge publishes a one-shot "startup-pin" trajectory holding the live pose, so the controller's internal setpoint matches reality and the vendor HW interface (`servo_moved_dead_band 0.05 rad`) stops snapping joints back to its stale ~0 command.
+<Mermaid chart={`flowchart TB
+  SRC["HMI / voice"]
+  ARMSVC["/lupin/arm/(joint)/set_angle_with_speed"]
+  GRPSVC["/lupin/gripper/set_angle_with_speed"]
+  BR["gripper_action_bridge<br/>clamp · startup-pin · torque gate"]
+  JTC["JointTrajectoryController"]
+  GAC["GripperActionController"]
+  HW["MirteMasterArmHWInterface<br/>0.05 rad dead-band re-assert"]
+  BUS["Hiwonder TTL servo bus"]
+  SRC --> ARMSVC
+  SRC --> GRPSVC
+  ARMSVC --> JTC
+  GRPSVC --> BR
+  BR --> GAC
+  JTC --> HW
+  GAC --> HW
+  HW --> BUS
+`} />
+
+On its first complete `/joint_states`, the bridge publishes a one-shot startup-pin trajectory holding the live pose, so the controller's internal setpoint matches reality and the vendor HW interface stops snapping joints back to its stale ~0 command. Enabling torque flips both `enable_all_servos` and the `enable_arm_control` gate so the HW interface actually drives the bus.
 
 ## Arm zero-offset calibration
 
 `arm_calibrate_server` exposes `/lupin/arm/calibrate` (`lupin_msgs/srv/CalibrateArm`) with `start | commit | cancel | status` actions for operator-in-the-loop Hiwonder zero-offset calibration. `start` disables servos so the operator hand-poses the arm; `commit` samples each servo's raw count for ~2 s and writes per-joint offsets via `/io/servo/hiwonder/<j>/_set_offset`, with a noise-floor gate and a small safety clamp to skip misassembled servos. It calibrates `shoulder_lift`, `elbow`, `wrist`, and `gripper` (`shoulder_pan` is deliberately omitted). This is **hardware-only**, the underlying Hiwonder bus services don't exist in sim.
 
+## Known hardware quirks
+
+The per-robot story of Mirte-247264 lives in the [war stories](/docs/war-stories); the load-bearing ones for anyone touching this chassis:
+
+<Accordions type="single">
+  <Accordion title="Backwards robot, right-looking map (the 180-degree base frame)">
+    Mirte-247264's mecanum base was wired with motor and encoder leads physically reversed in pairs, rotating the whole `base_link` frame 180° about Z from the real chassis, forward commands drove the robot backward while the SLAM map built clean but mirrored. The fix is a **matched** pin-swap per wheel in the telemetrix config: swap both motor pins `p1↔p2` **and** both encoder pins `A↔B` together. Swapping only the motor or only the encoder makes positive feedback, a runaway wheel, so always bench-test wheels-off-ground.
+  </Accordion>
+  <Accordion title="Green shows red (the BRG LED strip)">
+    Setting the strip GREEN shows red, BLUE shows green, RED shows blue. The strip is physically wired BRG and the vendor's `data_order: RBG` fix is a silent no-op in the C++ driver. Lupin compensates with `color_order: 'BRG'` on `light_strip_bridge`, a launch param, not a rebuild. Re-measure with a green/blue test if a different strip shows a different permutation.
+  </Accordion>
+  <Accordion title="The wheels that won't turn (free-spin = hard power-cycle)">
+    `ros2 control list_controllers` shows every controller `active`, `/joint_states` streams at 10 Hz, but nothing drives, not even priority-100 `/cmd_vel_joy`. The telemetrix board's MCU runs on USB power so it keeps reading encoders (controllers look healthy) while the motor H-bridge output goes dead. Feel the wheels by hand, if they spin freely the board is wedged and only a genuine hard power-cycle (main switch off ~15 s) revives it, a `systemctl restart mirte-ros` keeps the USB-powered board alive and will not reset it.
+  </Accordion>
+</Accordions>
+
+<Figure src="/photos/telemetrix-pcb-wiring.jpg" caption="The telemetrix PCB and the motor/encoder leads that were reversed in pairs on Mirte-247264, fixed with a matched per-wheel pin swap in the telemetrix config." />
+
+## See also
+
 <Cards>
-  <Card title="Networking" href="/docs/networking">Laptop ↔ robot DDS-over-WiFi, ports, and the systemd units.</Card>
+  <Card title="Networking" href="/docs/networking">Laptop to robot DDS-over-WiFi, ports, and the systemd units.</Card>
   <Card title="Operations" href="/docs/operations">Bring-up order, failure modes, and recovery on the real robot.</Card>
   <Card title="Teleop" href="/docs/teleop">The gamepad/web command bus, arm presets, and manual takeover.</Card>
   <Card title="Navigation" href="/docs/navigation">Nav2 tuned for the mecanum base, MPPI, Omni motion, narrow-aisle costmaps.</Card>

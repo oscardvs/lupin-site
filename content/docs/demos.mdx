@@ -1,65 +1,134 @@
 ---
 title: Demos
-description: Where the Lupin demo videos live, and how to add your own clips to the site.
+description: Where the Lupin demo footage lives, the DemoFrame ambient vs clip render modes, the build-time src-prop placeholder mechanism and its loud-magenta convention, the 01-05 cockpit slot scheme on the landing page, the in-docs Video and YouTube embeds, and the contract for filling each slot.
 ---
 
-The strongest thing a physical-robot project can show is the robot *moving*. This page,
-and the **See it move** section on the [home page](/), is where Lupin's demo footage
-goes. The slots are wired and waiting for clips.
+The strongest thing a physical-robot project can show is the robot *moving*. This page is the runbook for Lupin's demo footage, what each slot should hold, how an unfilled slot becomes a **loud placeholder**, and which component to reach for when you embed a clip inside the docs. The slots are wired and waiting; the footage is **deliberately** unrecorded in v1, and this page is the contract for filling it.
+
+<Figure src="/demos/landing-see-it-move-grid.png" caption="The 'See it move' section of the landing page, the 01 live-mission hero plus the 02-05 cockpit grid, all five slots currently rendering loud magenta placeholders that name the exact file to drop." />
 
 <Callout type="warn">
-  The demo videos are **placeholders** until real footage is dropped in. On the home page
-  the empty slots render a loud magenta placeholder naming the exact file to add, so an
-  unfilled demo can never be mistaken for finished work.
+  Every demo slot on the home page is a **placeholder** right now, on purpose. An empty slot renders a saturated magenta block naming the exact `public/demos/<name>.mp4` to add, so an unfilled demo can *never* be mistaken for finished work. They are not broken, they are unfilled.
 </Callout>
 
-## Planned clips
+## The slot lifecycle, and what actually upgrades it
 
-| Slot | File | What it should show |
-| --- | --- | --- |
-| Hero | `public/demos/hero.mp4` | A 10–20 s ambient loop: the robot navigating while the HMI map / twin update live. Autoplays muted on the landing page. |
-| Navigation (sim) | `public/demos/navigation.mp4` | Autonomous Nav2 navigation in the Gazebo greenhouse, a goal sent, a path planned and followed. |
-| Hardware run | `public/demos/hardware.mp4` | The real MIRTE Master driving an aisle and reading a tag. |
-| Twin + HMI | `public/demos/twin.mp4` | The web console: telemetry, the map, and the digital-twin heatmap filling in as tags are visited. |
-| Voice | `public/demos/voice.mp4` | A spoken command (“drive forward half a metre”, “go to table three”) executing through the voice agent. |
+The whole upgrade mechanism is one branch in `src/components/landing/demo.tsx`: `DemoFrame` renders a real `<video>` when its `src` prop is **truthy**, and the loud `Placeholder` otherwise. There is *no* filesystem-existence check anywhere. The component never asks whether `public/demos/hero.mp4` exists on disk, it only asks whether a `src` string was passed to it as a prop.
+
+This matters because of a sharp gotcha: on the landing page, `src` is **never** passed. The hero (`sections.tsx`) and the `02-05` grid both pass only `dropPath`, the file *to drop*, and let `mode` and `aspect` through, but they hand `DemoFrame` no `src`. So the landing slots are placeholders **today and always**, until someone edits `sections.tsx` to thread a `src` in. Dropping `hero.mp4` into `public/demos/` and refreshing changes *nothing* on its own, the README's "they appear here automatically" is the *target* wiring, not a working detection path yet.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> EmptySlot
+  EmptySlot --> LoudPlaceholder: "DemoFrame with no src prop"
+  LoudPlaceholder --> AmbientVideo: "src set AND mode=ambient"
+  LoudPlaceholder --> ClipVideo: "src set AND mode=clip"
+  AmbientVideo --> [*]
+  ClipVideo --> [*]
+  note right of LoudPlaceholder
+    The trigger is a src prop in sections.tsx,
+    NOT a file landing in public/demos.
+    No filesystem check exists.
+  end note
+  note right of AmbientVideo
+    autoplay muted loop, preload=metadata
+  end note
+  note right of ClipVideo
+    controls, preload=none
+  end note`} />
+
+<Callout type="info">
+  **The trigger is a code edit, not a file drop.** To make a landing slot go live you add the `src` prop where the slot is declared, the hero `DemoFrame` in `sections.tsx` and the `DEMOS` array's grid map. Until that prop is threaded, the loud placeholder is the correct, honest state. Treat the file-drop story as aspirational until the prop is wired.
+</Callout>
+
+## Two render modes, and why the props differ
+
+`DemoFrame` distinguishes two render `mode` values, and each picks a different set of `<video>` attributes for a concrete browser-policy reason.
+
+- **`mode="ambient"`**, the hero, renders `autoPlay muted loop playsInline` with `preload="metadata"`. Muting is **load-bearing**, not cosmetic, browsers honour unprompted autoplay *only* when the video is muted, so the hero must stay silent or it will not move on first paint. `preload="metadata"` fetches just enough to paint the first frame without pulling the whole file.
+- **`mode="clip"`**, the `02-05` grid, renders `controls` with `preload="none"`. The clip costs **zero bytes** until a visitor clicks play, which keeps the page light when four grid tiles sit below the fold.
+
+<Callout type="warn">
+  Because the hero **autoplays** over whatever network the visitor has, possibly the robot's own AP-mode link or a thin offline build, keep `hero.mp4` to **`<= 2-3 MB`** (the budget in `public/demos/README.md`), not the looser "a few MB" you may see elsewhere. A fat hero clip blocks first paint of the marquee section. Aim for 10-20 s at 720p and trim hard.
+</Callout>
+
+## Planned clips and the 01-05 slot scheme
+
+The landing page labels its slots with cockpit numbers, `01` is the hero and `02-05` are the grid, hardcoded in `sections.tsx`. Map the table rows to those labels so what you record lines up with what renders on screen.
+
+| Slot | On-screen label | File | What it should show |
+| --- | --- | --- | --- |
+| Hero | `01 · live mission` | `public/demos/hero.mp4` | A 10-20 s ambient loop, the robot navigating while the HMI map and twin update live. Autoplays muted, `mode="ambient"`. |
+| Grid | `02 · autonomous nav (sim)` | `public/demos/navigation.mp4` | Autonomous Nav2 navigation in the Gazebo greenhouse, a goal sent, a path planned and followed. |
+| Grid | `03 · hardware run` | `public/demos/hardware.mp4` | The real MIRTE Master driving an aisle and reading an AprilTag. |
+| Grid | `04 · twin + HMI live` | `public/demos/twin.mp4` | The web console, telemetry, the map, and the digital-twin heatmap filling in as tags are visited. |
+| Grid | `05 · voice command` | `public/demos/voice.mp4` | A spoken command ("drive forward half a metre", "go to table three") executing through the voice agent. |
+
+<Figure src="/demos/placeholder-screenshot.png" caption="The loud DEMO VIDEO PLACEHOLDER as it renders today, a 45-degree magenta hatch, an animated chartreuse scanline, reticle corner brackets, and the exact public/demos drop path written across it. The icon swaps Film for the ambient hero and Play for clip slots." />
+
+## Which component for which surface
+
+There are two component families, and the right choice depends on the *surface* and the *asset type*, not on preference. `DemoFrame` is landing-only, cockpit-framed, and decides its placeholder at **build time** from the `src` prop. The in-docs `Video` and `YouTube` components are for embedding a clip *inside* an MDX page, and `FacilityPhoto` is for a static photo, not a video.
+
+<Mermaid chart={`flowchart TD
+  A["Where does the demo go?"] --> B["Landing page slot?"]
+  A --> C["Inside a docs page?"]
+  B --> D["DemoFrame mode=ambient (hero)"]
+  B --> E["DemoFrame mode=clip (grid)"]
+  C --> F["Video or photo?"]
+  F --> G["Local mp4 -> Video src poster"]
+  F --> H["Long or hosted -> YouTube id"]
+  F --> I["Static photo -> FacilityPhoto src"]`} />
+
+Both `<Video>` and `<YouTube>` are globally registered in `src/components/mdx.tsx`, so a docs page can use them bare, no import line. The split is a hosting trade-off:
+
+- **`<Video src="/demos/navigation.mp4" />`**, a local mp4 served from `public/` through Vercel's CDN, ships in the repo and counts against repo size and bandwidth. Best for **short** ambient loops you want framed in the cockpit style with `preload="none"` click-to-play.
+- **`<YouTube id="..." />`**, a hosted clip, offloads bytes and bandwidth to YouTube and lazy-loads the iframe. It points at `youtube-nocookie.com`, the privacy-friendly host that sets no tracking cookies until play, which is the reason to prefer this component over a raw embed. Best for **long** narrated walkthroughs.
+
+```mdx
+<Video src="/demos/navigation.mp4" poster="/demos/navigation.jpg" />
+
+<YouTube id="YOUR_VIDEO_ID" title="Lupin autonomous run" />
+```
+
+<Callout type="info">
+  The **poster frame** advice applies to in-docs `<Video>` embeds, where you pass `poster` explicitly, not to the landing slots. On the landing page no `poster` is wired and the grid uses `preload="none"`, so the anti-layout-shift and social-preview benefits land only where an author supplies the prop. Wiring posters into the landing slots needs the same `sections.tsx` edit the `src` prop does.
+</Callout>
 
 ## Adding a clip
 
 <Steps>
 
 <Step>
-Record the clip and export it as an `.mp4` (H.264). Keep ambient loops short (10–20 s,
-720p, a few MB); use a higher-quality file only for the one hero clip.
+Record and export an `.mp4` (H.264). Keep ambient loops short, 10-20 s at 720p, hero `<= 2-3 MB`. Use a higher-quality file only for the one hero clip.
 </Step>
 
 <Step>
-Drop it into `public/demos/` with the filename from the table above. The home-page slot
-upgrades from the placeholder to a real player automatically, no code change needed.
+Drop it into `public/demos/` with the exact filename from the table. For an **in-docs** embed this is enough, `<Video src="/demos/<name>.mp4" />` finds it. For a **landing** slot, also thread the `src` prop into the matching `DemoFrame` in `sections.tsx`, because the slot branches on the prop, not on the file existing.
 </Step>
 
 <Step>
-To embed a clip *inside a docs page*, use the `<Video>` component with a path under
-`/public`:
-
-```mdx
-<Video src="/demos/navigation.mp4" poster="/demos/navigation.jpg" />
-```
-
-Or embed a hosted clip from YouTube:
-
-```mdx
-<YouTube id="YOUR_VIDEO_ID" title="Lupin autonomous run" />
-```
+Optionally export a poster frame at `/demos/<name>.jpg` and pass it as `poster` on the in-docs `<Video>`. It prevents layout shift, makes the load feel instant, and is what shows in social-media link previews.
 </Step>
 
 </Steps>
 
+## Why the placeholders are loud
+
+The magenta is a discipline, not decoration. The convention is a **triad**, a saturated self-emissive colour, a `PLACEHOLDER` token in the name, and a stated drop path, because the team learned the hard way that a *neutral* stand-in silently burns downstream time. A flat off-white plane once stood in for an AprilTag in the greenhouse perception pipeline and **silently** broke detection, nobody noticed within thirty seconds that the asset was fake. The bar since then is exactly that, would the next person notice within thirty seconds that this is not real. A fuchsia hatch with `DEMO VIDEO PLACEHOLDER` written across it passes that bar; a grey box does not.
+
+The placeholder's anatomy is built from shared cockpit primitives, not one-off styles, so anyone extending the site can reuse them: a 45-degree repeating magenta gradient `repeating-linear-gradient(45deg, hsla(300,100%,50%,0.08) ...)`, the animated chartreuse `.scanline` (a 6 s loop defined in `global.css`), the `.reticle` corner brackets baked into the frame, and a `Film` or `Play` icon keyed on `mode`. The drop path itself is highlighted in `text-fuchsia-200` so handoff is unambiguous.
+
+The site runs **two** placeholder mechanisms, and the difference is worth knowing. `DemoFrame` decides at **build time**, `src ? video : Placeholder`, so an absent video is known the moment the prop is absent. `FacilityPhoto` (`facility-photo.tsx`) decides at **runtime** instead, it tries to render the `<img>` and only swaps in its loud `IMAGE_PLACEHOLDER` on the image's `onError` (a `useState` `failed` flag), so a real photo wins automatically if the file is present. Same philosophy, two halves, a compile-time prop check for the videos and a runtime load-failure for the photos.
+
 <Callout type="info">
-  Always export a **poster frame** (`/demos/<name>.jpg`), it prevents layout shift, makes
-  the load feel instant, and is what shows in social-media link previews.
+  Reuse the framed components, never a bare `<img>` or a quiet grey box. Drop a video slot in with `<DemoFrame dropPath="/demos/x.mp4" />` and a photo with `<FacilityPhoto src="/team/x.jpg" />`, both ship the loud placeholder for free and inherit the reticle, scanline, and palette.
 </Callout>
 
+## See also
+
 <Cards>
-  <Card title="Architecture" href="/docs/architecture">See what the footage is actually showing.</Card>
-  <Card title="Quickstart" href="/docs/quickstart">Run it yourself and record your own.</Card>
+  <Card title="Web HMI" href="/docs/web-hmi">The mission console the twin and voice demos are showing.</Card>
+  <Card title="Architecture" href="/docs/architecture">What the footage is actually doing under the cockpit framing.</Card>
+  <Card title="Quickstart" href="/docs/quickstart">Run it yourself and record your own clips.</Card>
+  <Card title="War stories" href="/docs/war-stories">The bugs behind the loud-placeholder discipline.</Card>
 </Cards>

@@ -1,0 +1,179 @@
+---
+title: Simulation
+description: The Gazebo-classic greenhouse sim story, the generated greenhouse.world and south-aisle spawn, the Option-A gazebo_ros_planar_move drive path versus the ros2-control mecanum row, the single cmd_vel_out remap that is the only drive difference, the P3D teleport limitation that makes sim a path-planning tool not a controller rig, the sim_flower_detector HSV stand-in for YOLO, the event-driven wait_for_scan to wait_for_map cascade, the gazebo_ros2_control apt regression overlay fix, and the GAZEBO_PLUGIN_PATH sourcing requirement.
+---
+
+Lupin runs in **Gazebo-classic 11** against a generated greenhouse world, and the headline claim is the one the whole stack is built around: the *same* code runs in sim and on the real robot, only the deployment branch and a single drive topic change. SLAM, Nav2, the mission orchestrator, the perception aggregator, the digital twin, and the web HMI are byte-identical across the two targets, and exactly two seams differ, the **drive sink** that takes `cmd_vel`, and the **flower detector** that produces `/yolo/detections`.
+
+This page is the **map and runbook** for that simulator: which world loads and where the robot spawns, the two drive paths and why sim deliberately takes the *wrong-sounding* one, the P3D teleport limitation that makes nav-in-sim a planning-and-visual tool rather than a controller-tuning rig, the HSV stand-in that replaces YOLO, and the two environment footguns (`gazebo_ros2_control` and `GAZEBO_PLUGIN_PATH`) that burn every teammate on first run. For the navigation knobs the sim shares with hardware see [/docs/navigation](/docs/navigation), and for the perception contract see [/docs/perception](/docs/perception).
+
+## The world and where the robot spawns
+
+The world is `greenhouse.world`, an SDF emitted by `scripts/generate_greenhouse_world.py` whose coordinate frame is locked to `mdp-greenhouse`'s `tag_locations.json`, so a tag rendered in Gazebo sits at the same map coordinate the [greenhouse bridge](/docs/greenhouse-bridge) reports for it. `greenhouse_sim.launch.py` loads that SDF and spawns the **MIRTE Master** through the vendor pipeline, with one deliberate divergence: it does *not* forward `world=` into the vendor empty-world launch.
+
+<Callout type="info">
+  The vendor `gazebo_mirte_master_empty` launch **hardcodes** the spawn pose `(1.05, 0.51, 0.02)`, which falls inside the greenhouse south perimeter wall (the wall sits at `y ≈ 0.6`), so forwarding `world=` would give you an immediately-stuck robot. `greenhouse_sim.launch.py` instead replicates the vendor launch's contents and exposes the spawn pose as launch args, defaulting to the central aisle at `x:=2.0 y:=3.0 yaw:=1.5708`, facing `+Y` up the greenhouse toward Table1.
+</Callout>
+
+The spawn `z` is `0.0`, not a drop height. The base is a `<kinematic>` body (vendor design) and `gazebo_ros_planar_move` holds it at exactly that `z`, there is **no** gravity settling, so the 5 mm gap between the wheel bottoms and the floor is the final resting state, invisible and correct, not a robot hovering mid-air.
+
+<Figure src="/screenshots/greenhouse-world-gazebo.png" caption="The generated greenhouse.world in the Gazebo client: planter-row tables, printed 36h11 AprilTags on the box faces, and the MIRTE Master spawned in the central south aisle facing +Y." />
+
+## The two drive paths, and the one topic that differs
+
+This is the part the architecture page glosses and that this page exists to resolve honestly. There are two distinct ways the chassis can move in this stack, and sim and hardware take **different** ones.
+
+| Path | Drive sink topic | Who consumes it | Where it lives |
+| --- | --- | --- | --- |
+| `ros2_control` mecanum | `/mirte_base_controller/cmd_vel` (hardware) | vendor `mirte_telemetrix_cpp` controller | `onboard.launch.py` |
+| Option-A `planar_move` | `/cmd_vel` | `gazebo_ros_planar_move` plugin in the URDF | `greenhouse_sim.launch.py` |
+
+The single command bus (`twist_mux`) is *identical* on both targets, it arbitrates `/cmd_vel_joy`, `/cmd_vel_manual`, `/cmd_vel_auto`, and the idle-zero fallback by priority, and the **one** thing that changes between sim and hardware is the `cmd_vel_out` remap on `twist_mux`. On hardware that remap targets `/mirte_base_controller/cmd_vel`; in `sim_robot.launch.py` it targets `/cmd_vel`, which the Gazebo `planar_move` plugin subscribes to.
+
+<Mermaid chart={`graph LR
+  JOY["/cmd_vel_joy<br/>prio 100"] --> TM["twist_mux"]
+  MAN["/cmd_vel_manual<br/>prio 50"] --> TM
+  AUTO["/cmd_vel_auto<br/>prio 10"] --> TM
+  ZERO["/zero_cmd_vel<br/>prio 1 (sim idle)"] --> TM
+  TM -->|"cmd_vel_out remap"| OUT{"target?"}
+  OUT -->|"sim"| PM["/cmd_vel<br/>gazebo_ros_planar_move"]
+  OUT -->|"hardware"| HW["/mirte_base_controller/cmd_vel<br/>vendor controller"]
+`} />
+
+### Why sim takes Option A
+
+In sim, `greenhouse_sim.launch.py` *deliberately* does not spawn the `ros2_control` mecanum base controllers (`pid_wheels_controller` and `mirte_base_controller`). The arm, gripper, and `joint_state_broadcaster` controllers all still spawn, but the base is driven by the URDF's `gazebo_ros_planar_move` plugin directly. The reason is a TF collision, **`planar_move`** is already the single `odom`→`base_link` TF source, and also running the mecanum controller would publish a second, *competing* `odom` TF, which surfaces downstream as Nav2's "timestamp earlier than transform cache" drops.
+
+To keep the rest of the stack from knowing the difference, `greenhouse_sim.launch.py` runs an `odom_relay` (`topic_tools relay /odom → /mirte_base_controller/odom`) so the odom topic name matches hardware 1:1, the `nav2_params` `odom_topic` and the HMI `odomTopic` are unchanged across targets.
+
+### Resolving the `cmd_vel_unstamped` confusion
+
+There is a topic name, `/mirte_base_controller/cmd_vel_unstamped`, that causes real confusion, and it is worth stating plainly: it belongs to the `ros2_control` mecanum row, **not** to the working `planar_move` sim path.
+
+<Callout type="warn">
+  **The footgun.** `sim_full.launch.py` remaps `twist_mux` `cmd_vel_out` to `/mirte_base_controller/cmd_vel_unstamped`, a topic with *no subscriber* in that launch (Option A never spawns the mecanum controller). The actually-working sim drive path is `sim_robot.launch.py`, which remaps `cmd_vel_out` to `/cmd_vel` into `planar_move`. If you publish only to `/mirte_base_controller/cmd_vel_unstamped` you will move in some configs and silently no-op in others. Always run `ros2 topic info --verbose` before plumbing a drive topic, naming intuition lies on this stack.
+</Callout>
+
+The clean mental model is three rows: hardware drives `/mirte_base_controller/cmd_vel`, sim Option-A drives `/cmd_vel` into `planar_move`, and the `_unstamped` topic is the legacy `ros2-control-mecanum-only` sink, present in the vendor controller config but not on the path the greenhouse sim actually uses. Prefer the layered `sim_robot.launch.py` entry point, which is the one wired to the working `/cmd_vel` path.
+
+## The P3D teleport limitation
+
+The vendor MIRTE URDF embeds the `gazebo_ros_planar_move` plugin (a P3D-style teleport mover) that subscribes to `/cmd_vel` and moves the robot through Gazebo's pose API, it sets the body pose directly rather than applying wheel torques. That makes the simulator excellent for some things and worthless for others, and the distinction matters.
+
+<Callout type="warn">
+  **Sim is a path-planning and visual tool, not a controller-tuning rig.** Because `planar_move` teleports the kinematic base, there is **no** wheel-slip, friction, mecanum-roller dynamics, or acceleration fidelity. Nav2 plans a path and the robot follows it faithfully, which is exactly what you want for testing the mission FSM, costmap geometry, the perception pipeline, and the HMI. But tuning `MPPIController` gains or the velocity envelope against this sim is *meaningless*, those have to be validated on hardware. See [/docs/design-decisions](/docs/design-decisions) for why the team accepted this trade rather than vendoring a stripped, fully-actuated URDF.
+</Callout>
+
+What you *can* trust in sim: SLAM map quality, Nav2 global and local planning through the narrow plant-row aisles, the AprilTag discovery loop, the flower-localization geometry, and end-to-end mission state transitions. What you cannot: anything that depends on the dynamics between a commanded twist and the wheels actually achieving it.
+
+## The event-driven bring-up cascade
+
+`sim_full.launch.py` composes the whole simulation in one shot, and the elegant part is that it sequences upstream-dependent stages with `RegisterEventHandler(OnProcessExit)` sentinels instead of fixed sleeps. The sentinels are tiny `ros2 topic echo --once` processes that exit on first message receipt, so if a stage never produces its topic, the next stage simply *does not fire*, and you can see exactly which stage stalled instead of drowning in retry warnings.
+
+<Mermaid chart={`sequenceDiagram
+  participant L as launch
+  participant G as Gazebo
+  participant WS as wait_for_scan
+  participant SL as slam_toolbox
+  participant WM as wait_for_map
+  participant N as Nav2
+  L->>G: spawn world plus robot (t=0)
+  L->>WS: "echo --once /scan"
+  G-->>WS: first /scan
+  WS->>SL: OnProcessExit starts SLAM
+  SL-->>WM: first /map
+  Note over WM: "echo --once<br/>reliable plus transient_local"
+  WM->>N: OnProcessExit starts Nav2
+  Note over N: "autostart, ~15-30 s to ACTIVE"
+`} />
+
+The same logic ships as a *layered* alternative for when you want to see each stage land on its own console. `sim_robot.launch.py` is terminal 1 (Gazebo, the world, controllers, `twist_mux`, arm and gripper glue, the synthetic `/amcl_pose` seed, a sim battery publisher), `sim_autonomy.launch.py` is terminal 2 (SLAM, Nav2 in slam mode, the greenhouse bridge, perception, the mission orchestrator, the twin), and `sim_hmi.launch.py` is terminal 3 (`rosbridge` plus the web UI). Bring up terminal 1 first and confirm the controllers actually spawn before layering anything on top, if they do not come up there it is a `ros2_control` problem, not a perception or Nav2 one.
+
+<Tabs items={['Simulation','Hardware']}>
+  <Tab value="Simulation">
+
+```bash
+# One-shot: world plus SLAM plus Nav2 plus perception plus mission plus HMI
+ros2 launch lupin_bringup sim_full.launch.py
+# Open http://localhost:8090, drive a small loop so SLAM has scan context,
+# then start a mission:
+ros2 service call /mission/start lupin_msgs/srv/StartMission \
+  "{mission_type: 'ExplorationMission', discovery_goal: 4}"
+```
+
+  </Tab>
+  <Tab value="Hardware">
+
+```bash
+# Drive sink and detector differ on hardware; the rest is identical.
+# Real YOLO on the real gripper cam replaces sim_flower_detector,
+# and twist_mux cmd_vel_out points at /mirte_base_controller/cmd_vel.
+ros2 launch lupin_bringup onboard.launch.py
+```
+
+  </Tab>
+</Tabs>
+
+<Callout type="info">
+  If a previous launch left a zombie `gzserver` behind, the next bring-up inherits a half-dead world and the controllers never spawn. Run `scripts/sim-clean.sh` first to reap it. This is the most common "it worked yesterday" cause in sim.
+</Callout>
+
+## The flower detector: HSV stand-in for YOLO
+
+The *only* perception swap between sim and hardware is the flower detector, and that single substitution is the load-bearing reason the sim-to-hardware gap stays small. On hardware the trained `yolo_detector` runs `best.pt` on the gripper camera; in sim that model fires on **nothing**, because `best.pt` is trained on photographs of physical dahlias and Gazebo's emissive blossom textures look nothing like them.
+
+So sim runs `sim_flower_detector`, an HSV colour-segmentation node that segments the bright blossom colours `generate_greenhouse_world.py` paints into the world and publishes the *exact same* `/yolo/detections` JSON contract, `[{"class": int, "confidence": float, "bbox_xyxy": [x1,y1,x2,y2]}, ...]`, that the trained YOLO emits. Everything downstream of `/yolo/detections`, the `perception_aggregator`, the [digital twin](/docs/digital-twin), and the HMI, is byte-identical between the two targets.
+
+| Class id | Name | HSV signature |
+| --- | --- | --- |
+| `0` | `tulip_red` | magenta / hot-pink hue, very high saturation |
+| `1` | `tulip_white` | any hue, near-zero saturation, bright |
+| `2` | `tulip_pink` | pink hue, mid saturation, bright |
+| `3` | `bug` | dark anomaly marker, low value |
+
+The HSV bands are node parameters, not constants, the Gazebo render and lighting shift the colours, so the workflow is capture a frame on the `/sim_flower/overlay` debug image and re-tune. The aggregator takes the dominant non-`bug` class as the species while the robot is SCANNING a tag, and raises the `anomaly` flag when the `bug` class appears. The four `class` ids match `FlowerObservation.species` and the aggregator's `flower_class_names` default, so the contract holds across the swap.
+
+<Callout type="warn">
+  **The "only white tulips" myth.** On hardware the symptom of mostly-white classifications is camera *aim*, the wrist cam framing the white tag backing plate or grey walls so the largest blob is white, not a classifier bug. The HSV bands and the trained classes are both fine. See [/docs/perception](/docs/perception) for the box-geometry placement pipeline that consumes these detections.
+</Callout>
+
+## Two environment footguns
+
+Both of these burn every teammate on first run, and both are now fixed inside the launches, but you should know them because they fail in confusing, silent ways.
+
+### gazebo_ros2_control apt regression
+
+An apt rebuild of the `rcl` argument parser (around 2026-05) broke the apt `gazebo_ros2_control` plugin, which hands the *whole* URDF to `controller_manager` as a `--param robot_description:=<urdf>` CLI override rule, and the stricter `rcl` rejects the multi-line XML as an invalid param rule.
+
+<Callout type="error">
+  **Symptom.** Spawners loop forever on `Could not contact service /controller_manager/list_controllers` and `gzserver` logs a `parser error Couldn't parse parameter override rule` at `rcl/arguments.c`. **Cause.** The plugin returns *before* creating the `controller_manager`, so it never exists. **Fix.** Run `scripts/fix-gazebo-ros2-control.sh`, which builds a workspace overlay of `gazebo_ros2_control` with a two-line patch that sets `robot_description` directly on the node instead of via the CLI rule, no apt changes, fully reversible.
+</Callout>
+
+### GAZEBO_PLUGIN_PATH must be set
+
+Sourcing only `/opt/ros/humble/setup.bash` leaves `GAZEBO_PLUGIN_PATH` empty, then `gzserver` silently fails to load `libgazebo_ros_factory.so`, the `/spawn_entity` service never appears, `spawn_entity.py` hangs, and the camera plugin asserts on a null OGRE `Scene` shared pointer. The launch just looks "stuck booting" with no obvious error.
+
+`greenhouse_sim.launch.py` fixes this from the launch itself, it `AppendEnvironmentVariable`s the Ubuntu-22.04 / gazebo-classic-11 defaults for `GAZEBO_PLUGIN_PATH`, `GAZEBO_RESOURCE_PATH`, `GAZEBO_MODEL_PATH`, and `OGRE_RESOURCE_PATH`, so our launches work against a freshly-sourced ROS shell with no extra step. If you are running a *vendor* launch directly, source `/usr/share/gazebo/setup.sh` after ROS, and if a teammate reports "the robot never spawns" or `Assertion px != 0 failed`, the first thing to check is `echo $GAZEBO_PLUGIN_PATH`.
+
+## Sim nav quirks
+
+A handful of sim-specific values exist because Gazebo's sensors and clock behave slightly differently from the real robot. They live mostly in `slam_toolbox_sim.yaml` and the sim launch args.
+
+- **`base_frame: base_link`**, the MIRTE URDF does not publish `base_footprint`, so SLAM frames its scans against `base_link` directly.
+- **`min_laser_range: 0.25`**, the sim lidar reports 0 m hits *inside* the robot body, which would corrupt the map, so returns below 0.25 m are filtered out (the real RPLidar A1's effective max sits at the `max_laser_range: 12.0` end).
+- **BEST_EFFORT `cmd_vel` publishers**, a RELIABLE publisher against the BEST_EFFORT sim subscriber silently drops *every* message on the QoS mismatch, and the symptom is wheels idle even though `publish()` succeeds, so the drive publishers are BEST_EFFORT to match.
+- **`use_sim_time: true` everywhere**, every sim node runs on `/clock`, and the orchestrator stamps observations on sim time so the twin does not treat fresh map pins as stale.
+- **Slow first spawn**, the AWS small-house world on the `sim` branch can take 3-5 min to load on a cold laptop, and `sim_full` on a cold machine shows ~30 s of "waiting for nav2" chatter before the lifecycle goes green, this is DDS discovery plus the orchestrator's dependency wait absorbing the parallel start, not a fault.
+
+<Callout type="info">
+  The AMCL stand-in matters here too: sim has no AMCL, so `seed_amcl_pose` continuously republishes `map`→`base_link` as `/amcl_pose`, which is what clears the orchestrator's `PREPARE.LOCALIZING` state and its per-leg drift gate. It must run with sim time or the orchestrator sees stale poses. See [/docs/mission](/docs/mission) for how the FSM consumes that seed.
+</Callout>
+
+## See also
+
+<Cards>
+  <Card title="Architecture" href="/docs/architecture" />
+  <Card title="Navigation" href="/docs/navigation" />
+  <Card title="Perception" href="/docs/perception" />
+  <Card title="Greenhouse bridge" href="/docs/greenhouse-bridge" />
+</Cards>

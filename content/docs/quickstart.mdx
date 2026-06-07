@@ -1,9 +1,9 @@
 ---
 title: Quickstart
-description: Clone, build, and bring up Lupin end-to-end, one command in Gazebo, one against the real MIRTE Master, then start your first mission.
+description: Clone, build, and bring up Lupin end-to-end, one command in Gazebo and one against the real MIRTE Master, covering the mdp-greenhouse install gotcha, the DDS-over-WiFi discovery-server env, the event-driven sentinel cascade, the twist_mux command bus, the AMCL-seed gate, and your first /mission/start.
 ---
 
-This page takes you from a fresh clone to a running robot: prerequisites, build, the one-command bring-up, and the first mission. Lupin runs the *same code* in Gazebo and on the real MIRTE Master V2, only the branch and a single launch differ.
+This page takes you from a fresh clone to a robot that drives, maps, and runs a greenhouse mission, prerequisites, build, the one-command bring-up, and the first `/mission/start`. **Lupin** runs the *same code* in Gazebo and on the real MIRTE Master V2, only the deployment branch, a single drive topic, and the discovery-server env change. This page is the **runbook** for that first hour: do the steps in order, and the war stories woven through the callouts are the exact footguns that cost the team days so you skip them.
 
 ## Prerequisites
 
@@ -57,7 +57,7 @@ git checkout hardware     # real-robot bring-up, calibrated params
 </Tab>
 </Tabs>
 
-`main` holds code that is identical regardless of deployment target (messages, perception, planning, HMI logic); `sim` and `hardware` add their target-specific bring-up on top. This documentation site tracks the `hardware` branch.
+`main` holds code that is identical regardless of deployment target (messages, perception, planning, HMI logic); `sim` and `hardware` add their target-specific bring-up on top. This documentation site tracks the `hardware` branch. The [design decisions](/docs/design-decisions) page explains *why* the three-branch split exists.
 
 ## Build
 
@@ -82,6 +82,102 @@ Add the `source ~/ros2_ws/install/setup.bash` line to your `~/.bashrc` so every 
   ```
 </Callout>
 
+## What environment must be set
+
+The single biggest difference between a first sim run and a first hardware run is the **environment**, and the team's design goal was to make the answer lopsided: in sim you set *nothing*, on hardware you set the **DDS discovery-server env** once per laptop.
+
+In **simulation**, `greenhouse_sim.launch.py` hardcodes `GAZEBO_PLUGIN_PATH`, `GAZEBO_RESOURCE_PATH`, `GAZEBO_MODEL_PATH`, and `OGRE_RESOURCE_PATH` for gazebo-classic-11 in-launch via `AppendEnvironmentVariable`, so you do **not** source `/usr/share/gazebo/setup.sh`. That sourcing was the recurring *spawn_entity hangs / Scene shared_ptr null* footgun every teammate hit on their first sim run, and baking the env into the launch is the deliberate fix.
+
+On **hardware**, the laptop reaches the robot's nodes over WiFi through a **FastDDS discovery server**, not multicast, because most access points (the robot's own AP, hotspots, university APs) silently drop the multicast packets ROS 2 uses for discovery. Two flags wire it up, one on each side.
+
+<Steps>
+
+<Step>
+
+**On the robot**, enable the vendor discovery server and restart the service stack:
+
+```bash
+echo 'export MIRTE_FASTDDS=true' >> /home/mirte/.mirte_settings.sh
+sudo systemctl restart mirte-ros.service lupin-onboard.service lupin-cameras.service
+sudo ss -lnup | grep 11811   # expect fast-discovery-server on 0.0.0.0:11811
+```
+
+</Step>
+
+<Step>
+
+**On the laptop**, run the setup script once. It writes the FastDDS XML profile and three env vars (`FASTRTPS_DEFAULT_PROFILES_FILE`, `ROS_DISCOVERY_SERVER`, `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`) into `~/.config/lupin/ros-env.sh` and wires `~/.bashrc` to source it. Pass the robot's IP if it is not the AP default `192.168.42.1`:
+
+```bash
+./lupin_bringup/scripts/setup-laptop-dds-env.sh             # robot AP 192.168.42.1
+./lupin_bringup/scripts/setup-laptop-dds-env.sh 10.42.0.1   # wired static
+```
+
+</Step>
+
+<Step>
+
+**Verify** from a fresh terminal that the data graph is actually shared. The topic count is the tell, two means you are still on multicast and blind:
+
+```bash
+ros2 daemon start && sleep 5
+ros2 topic list | wc -l                          # expect 50+, NOT 2
+ros2 topic echo /io/power/power_watcher --once   # should print BatteryState
+```
+
+</Step>
+
+</Steps>
+
+<Callout type="warn">
+  **Symptom.** The HMI loads, the connection pill says "LIVE", yet every panel
+  is blank and the robot will not drive. **Cause.** A node's DDS mode is fixed
+  at launch from its environment; if `rosbridge_websocket` was started from a
+  long-lived terminal (a tmux pane, a VS Code tab) opened *before* the env
+  existed, it is on multicast and can never join the discovery-server graph.
+  **Fix.** Read the truth from `/proc/<pid>/environ`, an empty
+  `ROS_DISCOVERY_SERVER` confirms it, then relaunch from a fresh shell. Full
+  walkthrough on the [networking](/docs/networking) page.
+</Callout>
+
+`hardware.launch.py` mitigates this by *self-sourcing*: `_apply_dds_env_from_ros_env_sh()` parses the `export FOO=bar` lines of `~/.config/lupin/ros-env.sh` into its own process env at launch time, so every child (`rosbridge`, Nav2, RViz, the twin) inherits a **consistent** discovery-server env even from a stale terminal. As a bonus, `robot_ip` is *derived* from `ROS_DISCOVERY_SERVER`, so the HMI camera-tab `/_video` proxy target follows the link automatically, AP `192.168.42.1` or wired `10.42.0.1`, with no second place to edit when you go wired.
+
+## One-time robot-side services
+
+The `hardware` entry point is laptop-side and runs *on top of* onboard systemd services that must be installed **once per Mirte image**, the stock image does not ship them. Without these the chassis has no `twist_mux` arbitration, the arm has no preset server, the gripper has no action bridge, and the cameras run at the vendor's heavy default rate.
+
+```bash
+# On the robot, from a Lupin checkout under ~/ros2_ws/src/lupin
+sudo apt install ros-humble-twist-mux v4l-utils
+cd ~/ros2_ws && colcon build --packages-up-to lupin_bringup --symlink-install
+source ~/ros2_ws/install/setup.bash
+sudo bash $(ros2 pkg prefix lupin_bringup)/share/lupin_bringup/scripts/install-onboard-systemd.sh
+sudo bash $(ros2 pkg prefix lupin_bringup)/share/lupin_bringup/scripts/install-cameras-systemd.sh
+```
+
+Both scripts are idempotent and accept `--uninstall`. The result is the robot/laptop split below: the robot runs only what must live close to the hardware, the laptop runs everything with CPU headroom, and a single discovery-server link on port `11811` joins them.
+
+<Mermaid chart={`
+graph LR
+  subgraph Robot["Robot (systemd, no HMI)"]
+    direction TB
+    M["mirte-ros<br/>telemetrix · ros2_control · RPLidar"]
+    O["lupin-onboard<br/>twist_mux · arm_preset · gripper_bridge"]
+    C["lupin-cameras<br/>RGB + gripper at 5 fps"]
+    H["lupin-auto-home<br/>controller heal on boot"]
+  end
+  subgraph Laptop["Laptop (hardware.launch.py)"]
+    direction TB
+    W["lupin_web + rosbridge"]
+    S["slam_toolbox"]
+    N["Nav2"]
+    T["lupin_twin"]
+    P["perception + yolo_detector"]
+    R["RViz"]
+  end
+  Robot -->|"ROS_DISCOVERY_SERVER :11811"| Laptop
+`} />
+
 ## One-command bring-up
 
 Top-level launches live in `lupin_bringup`. There is one entry point per target. Each composes the whole stack and prints a clickable **HMI URL banner** at the top of the log.
@@ -93,11 +189,11 @@ Top-level launches live in `lupin_bringup`. There is one entry point per target.
 ros2 launch lupin_bringup sim_full.launch.py
 ```
 
-`sim_full.launch.py` composes the entire simulation mission stack in one shot: Gazebo + the MIRTE in the generated greenhouse world, the greenhouse sensor bridge, the mission orchestrator, `lupin_twin`, `rosbridge_websocket` on `:9090`, the Lupin web HMI on `:8090`, `seed_amcl_pose`, a draining `sim_battery_publisher`, `twist_mux`, Xbox teleop, the arm sim shim, and RViz.
-
-The chain is **event-driven, not delay-driven**: `slam_toolbox` starts only once `/scan` first publishes, and Nav2 (in slam mode) starts only once `/map` first publishes. A stalled stage is therefore visible as "the next stage never fired" rather than buried under retry warnings.
+`sim_full.launch.py` composes the entire simulation mission stack in one shot: Gazebo plus the MIRTE in the generated greenhouse world, the `greenhouse_bridge` sensor oracle, the `mission_orchestrator`, `lupin_twin`, the perception nodes (`tag_annotator` plus `perception_aggregator`), the `sim_flower_detector` colour stand-in, `rosbridge_websocket` on `:9090`, the Lupin web HMI on `:8090`, `seed_amcl_pose`, a draining `sim_battery_publisher`, `twist_mux`, `arm_library_server` plus `arm_preset_server`, Xbox teleop, and RViz.
 
 The banner prints `http://localhost:8090` and `http://<lan-ip>:8090` for the HMI.
+
+<Figure src="/screenshots/sim-greenhouse-spawn.png" caption="Gazebo greenhouse world at the default spawn (south aisle, 2.0/1.5/1.5708) facing the tables." />
 
 </Tab>
 <Tab value='Hardware'>
@@ -106,18 +202,50 @@ The banner prints `http://localhost:8090` and `http://<lan-ip>:8090` for the HMI
 ros2 launch lupin_bringup hardware.launch.py mission:=true
 ```
 
-`hardware.launch.py` is the **laptop-side** entry point. It runs on the operator's laptop on top of the robot's onboard systemd services (`mirte-ros`, `lupin-onboard`, `lupin-cameras`) and talks to the real MIRTE over the network. It brings up the Lupin web HMI (HTTPS `:8090` + `rosbridge_websocket` `:9090`), `slam_toolbox`, Nav2, `lupin_twin`, perception, the YOLO detector, and RViz; `mission:=true` adds the greenhouse bridge, mission orchestrator, and AMCL seed.
+`hardware.launch.py` is the **laptop-side** entry point. It runs on the operator's laptop on top of the robot's onboard systemd services (`mirte-ros`, `lupin-onboard`, `lupin-cameras`) and talks to the real MIRTE over the discovery-server link. It brings up the Lupin web HMI, `slam_toolbox`, Nav2, `lupin_twin`, perception, the real `yolo_detector`, and RViz; `mission:=true` adds the greenhouse bridge, mission orchestrator, and the AMCL seed.
 
-It self-sources `~/.config/lupin/ros-env.sh` so every child process inherits the DDS-over-WiFi discovery-server env. The banner prints `https://<lan-ip>:8090` (self-signed cert, accept it once per device).
+The web include pins `mode:=preview tls:=true rosbridge:=true video:=false leds:=false`. Video is `false` on purpose: `web_video_server` runs on the *robot* so raw frames never cross WiFi, and the Vite `/_video` proxy is retargeted at the robot's `:8091`. The banner advertises `https://<lan>:8090` for the HMI and `wss://<lan>:8090/_ros` for rosbridge, the browser reaches rosbridge through the Vite *same-origin proxy*, not `:9090` directly, which is what keeps the self-signed cert and mixed-content story clean.
 
 <Callout type="warn">
-  Laptop ↔ robot over WiFi needs the FastDDS discovery-server setup done once
-  per laptop, or the HMI loads "LIVE" but every panel is blank. See
-  [Deploy & networking](/docs/networking).
+  Laptop to robot over WiFi needs the FastDDS discovery-server setup above done
+  once, or the HMI loads "LIVE" but every panel is blank. The robot must also
+  be *single-homed*, a robot still running its AP while wired advertises an
+  unroutable locator and the data channel silently fails one-way. See
+  [networking](/docs/networking).
 </Callout>
 
 </Tab>
 </Tabs>
+
+<Figure src="/screenshots/hmi-bringup-banner.png" caption="The clickable HMI URL banner printed at the top of the launch log (local, LAN, and rosbridge endpoints)." />
+
+### The event-driven bring-up cascade
+
+The spine of every bring-up is a cascade that is **event-driven, not delay-driven**. Phase-1 nodes fire at `t=0` and forget (Gazebo or the robot, the HMI, rosbridge, the orchestrator, the seed), then a chain of tiny `ros2 topic echo --once` *sentinel* processes gates each upstream-dependent stage: each sentinel exits on its first message, and that `OnProcessExit` event kicks the next stage. The *why* is diagnostic, a stalled stage is visible as **the next stage never fired** rather than buried under a flood of retry warnings you have to learn to ignore.
+
+The sim chain is `wait_for_scan` then `slam_toolbox` then `wait_for_map` then Nav2. Hardware inserts one **extra** stage, `wait_for_tf` (a `wait_for_tf` sentinel with a 30 s budget on `odom→base_link`) between `/map` and Nav2, because a cold DDS-over-WiFi `/tf` subscription on the laptop takes ~5-10 s to populate, and Nav2's `local_costmap` activation does a single `canTransform()` with a short retry budget and bails with `Invalid frame ID base_link` if TF is not hot yet, leaving the lifecycle stuck.
+
+<Mermaid chart={`
+flowchart TD
+  L["ros2 launch"] --> P1["Phase 1 at t=0<br/>Gazebo/robot · HMI · bridge · orchestrator · seed"]
+  P1 --> WS["wait_for_scan"]
+  WS -->|"/scan"| SLAM["slam_toolbox"]
+  SLAM --> WM["wait_for_map"]
+  WM -->|"/map RELIABLE TRANSIENT_LOCAL"| BR{"target"}
+  BR -->|simulation| NAV["Nav2 lifecycle"]
+  BR -->|hardware| WT["wait_for_tf<br/>odom to base_link · 30s"]
+  WT -->|"tf hot"| NAV
+`} />
+
+<Callout type="warn">
+  **Symptom.** A sentinel for a latched topic never fires even though the topic
+  publishes. **Cause.** `/map` is **RELIABLE + TRANSIENT_LOCAL**, and a default
+  `ros2 topic echo` subscribes RELIABLE + VOLATILE, so the QoS negotiation
+  silently never connects. **Fix.** The `wait_for_map` sentinel passes
+  `--qos-reliability reliable --qos-durability transient_local` explicitly. The
+  same trap fakes "no data" for BEST_EFFORT topics like `/scan`, treat any
+  laptop "no data" as inconclusive and match the QoS.
+</Callout>
 
 ### Key launch arguments
 
@@ -130,14 +258,25 @@ Each subsystem sits behind a boolean (or scalar) launch argument, so you can opt
 | `nav2` | (auto) | `true` | Nav2 stack in slam mode; waits for `/map` (and a hot `odom→base_link` TF on hardware) before activating. |
 | `twin` | (always) | `true` | `lupin_twin` aggregator → `/twin/state`. |
 | `mission` | (always) | `false` | Greenhouse bridge + orchestrator + AMCL seed bundle. Turn on for mission runs. |
-| `perception` | n/a | `true` | `tag_annotator` (AprilTag) + `perception_aggregator`. |
-| `yolo` | n/a | `true` | YOLO flower/anomaly detector (heavy; needs `ultralytics` + `numpy<2`). |
+| `perception` | (always) | `true` | `tag_annotator` (AprilTag) + `perception_aggregator`. |
+| `yolo` | n/a (HSV stand-in) | `true` | Real YOLO flower/anomaly detector (heavy; needs `ultralytics` + `numpy<2`). |
 | `rviz` | `true` | `true` | RViz with the persistent `full_bringup_viz.rviz` config. |
 | `joystick` | `true` | `true` | Xbox controller teleop. Set false on hosts without a pad, `joy_node` logs noisily otherwise. |
-| `seed_amcl` | `true` | (via `mission`) | Publishes a synthetic `/amcl_pose` to clear the orchestrator's `PREPARE.LOCALIZING` gate (slam mode has no AMCL). |
+| `seed_amcl` | `true` | (via `mission`) | Runs `seed_amcl_pose`, the continuous `/amcl_pose` republisher that clears the orchestrator's `PREPARE.LOCALIZING` gate (slam mode has no AMCL). |
 | `dependency_timeout_s` | `120.0` | `120.0` | How long the orchestrator waits for Nav2 + bridge before going to `FAULT`. |
 
 In sim, `spawn_x` / `spawn_y` / `spawn_yaw` (`2.0` / `1.5` / `1.5708`) set the MIRTE's pose in the greenhouse world, the default puts it in the south aisle facing the tables. On hardware, `discovery_goal` (`5`) sets how many distinct tags an `ExplorationMission` discovers before switching to the monitoring loop.
+
+<Callout type="info">
+  **Why no YOLO in sim.** `best.pt` is trained on real dahlias and fires on
+  nothing in Gazebo, so `sim_flower_detector` is an HSV colour stand-in that
+  publishes the *same* `/yolo/detections` contract. The
+  `perception_aggregator`, twin, and HMI are then identical sim vs hardware,
+  the detector is the only swap. On the laptop the real `yolo_detector` needs
+  `ultralytics` installed carefully: a plain `pip install ultralytics` drags in
+  numpy 2 and pip's `opencv-python`, both of which shadow the system packages
+  and break `cv_bridge`. Pin `numpy<2` and `pip uninstall opencv-python` after.
+</Callout>
 
 <Callout type="info">
   Headless smoke test (no HMI, no RViz window) on either target:
@@ -150,9 +289,38 @@ In sim, `spawn_x` / `spawn_y` / `spawn_yaw` (`2.0` / `1.5` / `1.5708`) set the M
   ```
 </Callout>
 
+## The chassis command bus
+
+Before you drive, know what actually moves the wheels, because the drive topic is the classic sim-vs-hardware trap: a node that drives perfectly in Gazebo can publish into a void on the real Mirte. The reason is that the terminal controller topic differs, sim's clearpath controller listens on `/mirte_base_controller/cmd_vel_unstamped`, the real Mirte firmware wires `/mirte_base_controller/cmd_vel` with no `_unstamped` remap, and the unstamped topic simply **does not exist** on hardware.
+
+The fix is to never publish at the controller directly. Every drive source goes through **`twist_mux`**, which arbitrates by priority and timeout, the Xbox dead-man on `/cmd_vel_joy` (100) always wins, the web HMI joystick on `/cmd_vel_manual` (50) is the remote-operator override, and Nav2's velocity smoother on `/cmd_vel_auto` (10) loses to either human. The mux's output is the per-branch terminal topic, so you publish through the bus and arbitration handles the difference for you.
+
+<Mermaid chart={`
+flowchart LR
+  J["/cmd_vel_joy<br/>Xbox dead-man · prio 100"] --> MUX["twist_mux"]
+  H["/cmd_vel_manual<br/>web HMI · prio 50"] --> MUX
+  A["/cmd_vel_auto<br/>Nav2 smoother · prio 10"] --> MUX
+  MUX -->|hardware| HW["/mirte_base_controller/cmd_vel"]
+  MUX -->|simulation| SU["cmd_vel_unstamped"]
+  SU --> VMUX["vendor twist_mux · prio 200"]
+  VMUX --> CV["/cmd_vel · planar_move"]
+`} />
+
+<Callout type="warn">
+  **Symptom.** Nothing drives, not the HMI joystick, not even a raw terminal
+  `ros2 topic pub`. **Cause.** The HMI boots with the e-stop *engaged* and
+  publishes a 20 Hz **zero** Twist heartbeat to `/cmd_vel_manual`; at priority
+  50 those zeros out-vote a raw publish, and `estopAutoOnFocusLoss` re-latches
+  the e-stop when you alt-tab away to test. **Fix.** Click **Reset E-stop**
+  before driving; isolate the controller layer with priority-100
+  `/cmd_vel_joy` first. See [web HMI](/docs/web-hmi) and [teleop](/docs/teleop).
+</Callout>
+
 ## Once it's up
 
 Wait for the chain to settle, Gazebo loaded (or the robot's `/scan` live), `mirte_base_controller` active, Nav2 lifecycle reporting `Managed nodes are active`, and the orchestrator printing `Dependencies up. Orchestrator READY.`
+
+<Figure src="/screenshots/rviz-full-bringup.png" caption="RViz with the persistent full_bringup_viz config: /map, /scan, the TF tree, the Nav2 plan, and the robot model after a settled bring-up." />
 
 <Steps>
 
@@ -171,7 +339,7 @@ The rosbridge pill in the top bar goes green within a couple of seconds.
 
 **Drive a short loop.** Open the **Teleop** tab and nudge the robot around (left joystick = linear x/y, right = angular z). `slam_toolbox` needs a few scans of context before Nav2 will plan, its global costmap won't extend beyond the explored region.
 
-In **simulation only**, do a one-time per-browser setting first: gear icon → **Drive** → set the `cmd_vel topic` to `/cmd_vel_manual`. The sim's `twist_mux` arbitrates between Nav2 (`/cmd_vel_auto`) and manual override (`/cmd_vel_manual`); publishing straight to the controller topic bypasses the mux and races Nav2.
+In **simulation only**, do a one-time per-browser setting first: gear icon → **Drive** → set the `cmd_vel topic` to `/cmd_vel_manual`. That feeds the web joystick into `twist_mux` instead of racing Nav2 on the controller topic.
 
 </Step>
 
@@ -188,8 +356,8 @@ The orchestrator transitions `READY → PREPARE` and replies with `accepted` and
 
 <Callout type="info">
   In sim, prefer tags near the spawn aisle (`['1','2']`) for your first
-  end-to-end run, the P3D plugin's pose drift accumulates over long runs.
-  See [Navigation](/docs/navigation).
+  end-to-end run, the P3D plugin's pose drift accumulates over long runs. See
+  [navigation](/docs/navigation).
 </Callout>
 
 </Step>
@@ -209,6 +377,33 @@ ros2 topic echo /floranova/observations lupin_msgs/msg/Observation
 
 </Steps>
 
+### The AMCL-seed gate, and why the seed is continuous
+
+The orchestrator gates `PREPARE.LOCALIZING` on a low-covariance `/amcl_pose` (diagonal covariance below `0.25`) before it will navigate, exactly as it does against real AMCL on hardware. The sim has no AMCL, `slam_toolbox` owns `map→odom`, so `seed_amcl_pose` is AMCL's stand-in: at 10 Hz it looks up the live `map→base_link` TF and republishes it as a tight-covariance `PoseWithCovarianceStamped` (`0.01` on x, y, yaw).
+
+It is a **continuous** node, not a one-shot publish-then-exit, and that distinction is a real distributed-systems lesson the team learned the hard way. The original seed published once and exited; that was a bug. **TRANSIENT_LOCAL** latching only persists while the *publisher* is alive, and the orchestrator subscribes minutes later when a mission starts, so the late subscriber got nothing, localization never converged, and the orchestrator dropped to `FAULT`. The second reason a static seed fails is the *drift gate*: each approach leg re-checks AMCL drift, and a fixed origin pose would make the moving robot look wildly drifted, so the seed must track the real `map→base_link` pose to keep both the observations and the gate honest.
+
+<Mermaid chart={`
+stateDiagram-v2
+  [*] --> BOOT
+  BOOT --> READY
+  READY --> PREPARE
+  state PREPARE {
+    [*] --> LOCALIZING
+    LOCALIZING --> READYNAV: amcl_pose cov below 0.25
+  }
+  PREPARE --> INSPECTING
+  PREPARE --> EXPLORING
+  EXPLORING --> MONITORING
+  INSPECTING --> RETURNING
+  MONITORING --> RETURNING
+  RETURNING --> DONE
+  PREPARE --> FAULT: dependency_timeout_s
+  DONE --> [*]
+`} />
+
+The full state machine and the per-leg drift gate live on the [mission](/docs/mission) page.
+
 ### Operator controls
 
 These `std_srvs/srv/Trigger` services act on a running mission at any time:
@@ -222,11 +417,22 @@ ros2 service call /mission/skip_current  std_srvs/srv/Trigger
 
 The web HMI's permanent E-STOP bar also preempts the mission. Releasing E-STOP clears `/e_stop_state`, but the mission stays paused until you call `/mission/resume`.
 
+<Callout type="info">
+  **Hardware mission caveats, by design.** `hardware.launch.py` prints a loud
+  banner that `require_visual_confirmation=false`, readings come from the
+  greenhouse bridge *oracle* even though `/perception/confirm_tag` exists, so
+  the camera is **not** gating the readings. Separately, on the deployed
+  `hardware`-branch onboard the HMI **Arm** tab Enable and sliders are gated
+  off because `/lupin/arm/set_torque` is absent there; Xbox arm control still
+  works because `arm_teleop` bypasses the strict arming gate. Use the pad as
+  the arm fallback until the onboard branch is redeployed.
+</Callout>
+
 ## See also
 
 <Cards>
   <Card title='Architecture' href='/docs/architecture'>The node/topic graph and the sim ↔ hardware boundary.</Card>
-  <Card title='Web HMI & voice' href='/docs/web-hmi'>The browser mission console on :8090 and its voice agent.</Card>
+  <Card title='Networking' href='/docs/networking'>The FastDDS discovery-server setup and the multi-homing trap.</Card>
   <Card title='Mission orchestrator' href='/docs/mission'>The state machine behind /mission/start and /mission/state.</Card>
   <Card title='Operations' href='/docs/operations'>Bring-up order, failure modes, and recovery.</Card>
 </Cards>

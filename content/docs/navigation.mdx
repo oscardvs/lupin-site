@@ -1,235 +1,279 @@
 ---
 title: Navigation
-description: Nav2 tuned for the holonomic mecanum base, MPPI with an Omni motion model, narrow-aisle costmaps, and one launch file with AMCL or SLAM modes.
+description: Nav2 tuned for the holonomic mecanum base, MPPI with an Omni motion model, narrow-aisle costmaps, the six-launch slam/nav wrapper topology, the wait_for_scan to wait_for_map to wait_for_tf sentinel cascade, the cmd_vel to twist_mux arbitration chain, the bond_timeout WiFi fix, and the kill-and-respawn map reset.
 ---
 
-Lupin navigates with [Nav2](https://docs.nav2.org/) tuned end-to-end for a holonomic
-mecanum base. The whole stack is one package, `lupin_navigation`, with a single launch
-file and a single source-of-truth params file. The MPPI controller runs an `Omni`
-motion model so the base actually strafes sideways instead of having its lateral
-velocity samples thrown away, and the costmaps are sized for ~0.8 m greenhouse aisles
-rather than open rooms.
+Lupin navigates with [Nav2](https://docs.nav2.org/) tuned end-to-end for a **holonomic mecanum base**, an `MPPIController` running an `Omni` motion model so the chassis actually strafes sideways, and costmaps sized for the ~0.8 m gaps between greenhouse plant rows rather than the open rooms Nav2 ships defaults for. Everything lives in one package, `lupin_navigation`, with one params file as the single source of truth and a small fan of launch wrappers over a shared core.
 
-The same config runs in Gazebo and on the real robot, the frames, odometry topic, and
-laser ranges are deliberately aligned across both.
+This page is the **runbook and reference** for that stack: how the six launch files compose, why Nav2 cannot just come up alongside SLAM, what every load-bearing parameter buys, and how the cmd_vel output threads through arbitration to the wheels. The interesting parts are not the Nav2 defaults Lupin keeps, they are the handful it changes and the ordering it enforces around them.
 
-## One launch file, two modes
+## Launch topology: wrappers over a core
 
-`nav2.launch.py` stands up the full Nav2 lifecycle stack. A single `slam` argument
-selects between the two operating modes:
+The package ships **six launch files**, not the single `nav2.launch.py` an older revision documented. The shape is a *core-plus-wrapper* pattern on both halves, SLAM and Nav2, with the wrappers existing only to preset the two things that differ between targets: `slam:=true` and `use_sim_time`.
 
-- **`slam:=false` (default)**, localization against a *saved* map. Brings up
-  `map_server` + `amcl` + `lifecycle_manager_localization` alongside the navigation
-  half. AMCL owns the `map → odom` transform.
-- **`slam:=true`**, the localization half is dropped (via `UnlessCondition`) so an
-  *external* `slam_toolbox` node can own `/map` and the `map → odom` TF. Use this in a
-  world without a saved map (e.g. the greenhouse), where slam_toolbox builds the map
-  online and Nav2 plans against it.
+<Mermaid chart={`graph TD
+  subgraph SLAM
+    SS["slam_sim.launch.py"] -->|"use_sim_time true"| SC["_slam_core.launch.py"]
+    SH["slam_hardware.launch.py"] -->|"use_sim_time false"| SC
+    SC --> ST["slam_toolbox (respawn=True)"]
+    SC --> SR["slam_reset_node"]
+  end
+  subgraph Nav2
+    NS["nav2_sim.launch.py"] -->|"slam true · use_sim_time true"| NC["nav2.launch.py (core)"]
+    NH["nav2_hardware.launch.py"] -->|"slam true · use_sim_time false"| NC
+    NC --> NAV["controller_server · planner · bt_navigator · smoother"]
+  end
+  ST -->|"/map · map to odom TF"| NAV
+`} />
 
-The navigation half is always launched: `controller_server`, `planner_server`,
-`behavior_server`, `bt_navigator`, `waypoint_follower`, `velocity_smoother`, and
-`lifecycle_manager_navigation`.
-
-All node parameters come from `config/nav2_params.yaml`, wrapped in a `RewrittenYaml`
-that substitutes `use_sim_time` and the map path (`yaml_filename`) at launch time.
+The core files take all the real arguments; the wrappers are three lines of `IncludeLaunchDescription` each. `_slam_core.launch.py` is underscore-prefixed because you are **not** meant to run it directly, the `use_sim_time` arg has no sensible default for both targets, so you always go through `slam_sim.launch.py` or `slam_hardware.launch.py`. The recommended manual workflow is `slam_<env>.launch.py` first, then `nav2_<env>.launch.py`, and the old `ros2 launch slam_toolbox online_async_launch.py ...` invocation the package README still shows is *retired*, it cannot be SIGTERM-restarted for the map-erase feature (see [Resetting the map](#resetting-the-map)).
 
 ### Launch arguments
 
+`nav2.launch.py` is the only file that declares arguments; the wrappers bake them in. All node parameters come from `config/nav2_params.yaml`, wrapped in a `RewrittenYaml` that substitutes `use_sim_time` and the map path (`yaml_filename`) at launch time.
+
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `use_sim_time` | `true` | Use `/clock` from Gazebo. Set `false` on hardware. |
+| `use_sim_time` | `true` | Use `/clock` from Gazebo. The hardware wrapper sets `false`. |
 | `autostart` | `true` | Lifecycle managers auto-activate their nodes. |
-| `slam` | `false` | If `true`, skip `map_server`/`amcl`/localization lifecycle manager. |
-| `map` | `<pkg>/maps/krr_house.yaml` | Saved map handed to `map_server` (non-SLAM mode). |
+| `slam` | `false` | If `true`, skip `map_server`/`amcl`/localization lifecycle manager so `slam_toolbox` owns `map -> odom`. Both wrappers set `true`. |
+| `map` | `<pkg>/maps/krr_house.yaml` | Saved map for `map_server` in AMCL mode; a *placeholder path* in slam mode (see below). |
 | `params_file` | `<pkg>/config/nav2_params.yaml` | Nav2 params; override to fork tuning per branch. |
+
+<Callout type="info">
+  **SLAM is the live mode, AMCL is the dormant one.** Every orchestrated entry point hard-sets `slam:=true`: `nav2_sim.launch.py`, `nav2_hardware.launch.py`, and the full `lupin_bringup/hardware.launch.py` cascade. The `map_server` + `amcl` half is a code path kept warm for a future saved-map workflow, it is never instantiated in a real run, where `slam_toolbox` owns the `map -> odom` transform.
+</Callout>
 
 <Tabs items={['Simulation','Hardware']}>
 <Tab value='Simulation'>
 
-Default mode uses the bundled saved map of the AWS small-house ("KRR house") world:
+Two terminals, SLAM first so `/map` exists before Nav2 activates:
 
 ```bash
-ros2 launch lupin_navigation nav2.launch.py use_sim_time:=true
-```
-
-SLAM mode for an unmapped world, run slam_toolbox separately, then launch Nav2:
-
-```bash
-ros2 launch slam_toolbox online_async_launch.py use_sim_time:=true \
-    slam_params_file:=$(ros2 pkg prefix lupin_navigation)/share/lupin_navigation/config/slam_toolbox_sim.yaml
-
-ros2 launch lupin_navigation nav2.launch.py use_sim_time:=true slam:=true
+ros2 launch lupin_navigation slam_sim.launch.py    # slam_toolbox + slam_reset_node
+# drive the base a little (teleop) so slam_toolbox has scan context, then:
+ros2 launch lupin_navigation nav2_sim.launch.py    # waits for /map, then activates
 ```
 
 </Tab>
 <Tab value='Hardware'>
 
-The only difference is the clock source, wheel odometry, frames, and laser ranges are
-already identical to sim:
+Same order, the hardware wrappers only flip `use_sim_time` to `false`:
 
 ```bash
-ros2 launch lupin_navigation nav2.launch.py use_sim_time:=false
+ros2 launch lupin_navigation slam_hardware.launch.py
+# confirm /map and warm the TF:
+ros2 run lupin_bringup wait_for_tf odom base_link 30.0
+ros2 launch lupin_navigation nav2_hardware.launch.py
 ```
 
-SLAM mode is the same, with `use_sim_time:=false` on both launches:
-
-```bash
-ros2 launch slam_toolbox online_async_launch.py use_sim_time:=false \
-    slam_params_file:=$(ros2 pkg prefix lupin_navigation)/share/lupin_navigation/config/slam_toolbox_sim.yaml
-
-ros2 launch lupin_navigation nav2.launch.py use_sim_time:=false slam:=true
-```
+In the full robot bring-up this whole sequence is automated, see [the sentinel cascade](#why-nav2-waits-the-sentinel-cascade). The map (`map:=krr_house.yaml`) is forwarded purely to satisfy `RewrittenYaml`; `map_server` is not started in slam mode, but a literal empty path makes substitution explode.
 
 </Tab>
 </Tabs>
 
+## Why Nav2 waits: the sentinel cascade
+
+The single biggest *why* on this page is an ordering dependency that looks like ceremony until you hit the wedge it prevents. **Nav2 cannot be launched alongside SLAM.** Its lifecycle activation does a one-shot TF lookup of `odom -> base_link` during `local_costmap` configure; if that transform is not yet in the buffer the configure throws `Invalid frame ID base_link` and the managed node stays inactive **with no automatic retry**, which wedges the entire lifecycle manager. `slam_toolbox` publishes `map -> odom` only after it has ingested scans, so on a cold DDS-over-WiFi start there is a real window, ~5-10 s, where the transform simply is not there yet.
+
+`lupin_bringup/hardware.launch.py` closes that window with a `RegisterEventHandler` chain that gates each stage on the previous one exiting cleanly.
+
+<Mermaid chart={`sequenceDiagram
+  participant B as bringup
+  participant Sc as "/scan"
+  participant SL as slam_toolbox
+  participant M as "/map"
+  participant TF as "TF buffer"
+  participant N as "Nav2 lifecycle"
+  B->>Sc: wait_for_scan (echo --once)
+  Sc-->>B: scan online
+  B->>SL: start slam_toolbox
+  SL->>M: publish /map + map to odom TF
+  B->>M: wait_for_map (echo --once, reliable+transient_local)
+  M-->>B: /map online
+  B->>TF: wait_for_tf odom base_link 30s
+  TF-->>B: odom to base_link warm
+  B->>N: activate Nav2 lifecycle
+  N->>TF: one-shot odom to base_link lookup (succeeds)
+  Note over N,TF: if activated before TF is warm: Invalid frame ID base_link, lifecycle wedges with no retry
+`} />
+
+Each sentinel is a throwaway `ros2 topic echo --once` (or the `wait_for_tf` helper) whose process exit fires the next stage. `wait_for_map` subscribes `RELIABLE` + `TRANSIENT_LOCAL` so the QoS negotiation with `slam_toolbox`'s latched `/map` actually connects, a default-`RELIABLE` echo would silently never match and the cascade would hang forever. When you run the wrappers by hand, **you** are the cascade: launch SLAM, eyeball `/map` in RViz, warm the TF, then launch Nav2.
+
+### The bond_timeout WiFi fix
+
+A second cold-start trap lives in the lifecycle managers themselves. Nav2's `lifecycle_manager` bonds with each managed node and aborts the whole stack if the bond does not form within `bond_timeout`, which defaults to `4.0` s. Over the FastDDS discovery-server WiFi link the lifecycle-to-server bond round-trips through the robot's discovery server at `:11811` and can take longer than 4 s on a cold bring-up, spuriously tripping `unable to be reached after 4.00s by bond` and killing a launch that was otherwise fine.
+
+<Callout type="warn">
+  Both lifecycle managers in `nav2.launch.py` raise `bond_timeout` from the `4.0` s default to `20.0` s. This is a real debugged failure mode, not padding: on a *wired* link the bond still forms in `< 1` s so the larger ceiling is harmless, but over WiFi the 4 s default was aborting the stack at the bond before any node ever configured.
+</Callout>
+
 ## MPPI for a holonomic base
 
-The controller is `nav2_mppi_controller::MPPIController`, chosen from day one with no DWB
-detour. The single change that makes mecanum driving work is `motion_model: "Omni"`, on
-any other motion model MPPI zeroes the lateral (`vy`) samples and discards the holonomic
-capability entirely.
+<Figure src="/screenshots/rviz-mppi-rollout-aisle.png" caption="MPPI candidate rollouts (TrajectoryVisualizer) fanning sideways as the mecanum base strafes into a narrow aisle in RViz, with the thin inflation halo visible against the 0.8 m row gap." />
 
-The velocity envelope is asymmetric forward/back but symmetric sideways, so left-strafe
-and right-strafe trajectories are sampled equally:
+The controller is `nav2_mppi_controller::MPPIController`, chosen from day one with no DWB detour. The single change that makes mecanum driving work is `motion_model: "Omni"`, and the mechanism is worth spelling out because it explains the whole page. MPPI works by sampling a cloud of noised control rollouts and weighting them by cost. With `motion_model: Omni` the noised distribution is **3-DOF**, it samples `(vx, vy, wz)`, so every batch contains candidate trajectories that translate sideways. With a `DiffDrive` or `Ackermann` model the `vy` dimension is *constrained to zero*, so every sampled trajectory is a forward arc and the holonomic shortcut is **never even a candidate**. The lateral capability is not penalised away, it is structurally absent from the search.
+
+The velocity envelope is asymmetric forward/back but deliberately symmetric sideways:
 
 | Limit | Value | Note |
 | --- | --- | --- |
 | `vx_max` | `0.5` m/s | Forward |
 | `vx_min` | `-0.35` m/s | Reverse |
 | `vy_max` | `0.5` m/s | Strafe right |
-| `vy_min` | `-0.5` m/s | Strafe left (symmetric so samples don't collapse to 0) |
+| `vy_min` | `-0.5` m/s | Strafe left |
 | `wz_max` | `1.9` rad/s | Yaw |
 
-The MPPI rollout samples `batch_size: 2000` trajectories of `time_steps: 56` at
-`model_dt: 0.05`, running at `controller_frequency: 20.0` Hz. Lateral motion is treated
-as a first-class capability, not a fallback: the `min_y_velocity_threshold` is `0.001`
-(lateral motion is never gated), and `PreferForwardCritic` keeps a low `cost_weight: 1.0`
-(dropped from the diff-drive default of `5.0`) so MPPI doesn't bias away from a cleanly
-shorter sideways approach.
+The `vy` symmetry is the same sampling logic one level down: leave `vy_min` at the Nav2 default of `0.0` and the noised distribution can only push *right*, so left-strafe samples collapse and the controller explores half the lateral space it should. The MPPI rollout samples `batch_size: 2000` trajectories of `time_steps: 56` at `model_dt: 0.05`, running at `controller_frequency: 20.0` Hz, with `min_y_velocity_threshold: 0.001` so lateral motion is never gated as noise.
 
-<Callout type="info">
-  The MPPI acceleration envelope (`ax_max: 2.5`, `ay_max: 2.5`, `az_max: 3.2`) is kept in
-  sync with the velocity smoother's `max_accel`. If MPPI samples outside the smoother's
-  caps, the smoother chops the trajectory MPPI just optimised and `PathAlign` drifts.
-  Change one, change the other.
-</Callout>
+### The critic stack
 
-The global planner is `nav2_navfn_planner/NavfnPlanner` (Dijkstra: `use_astar: false`,
-`allow_unknown: true`, `tolerance: 0.5`).
+MPPI scores each rollout through **eight critics** with weights chosen to balance path adherence against obstacle avoidance against goal capture, with a deliberately low forward bias for the mecanum base.
+
+<Mermaid chart={`graph LR
+  MPPI["FollowPath / MPPIController"] --> PA["PathAlign · 14"]
+  MPPI --> OB["Obstacles · crit 20 / collision 10000"]
+  MPPI --> G["Goal · 5"]
+  MPPI --> PF["PathFollow · 5"]
+  MPPI --> C["Constraint · 4"]
+  MPPI --> GA["GoalAngle · 3"]
+  MPPI --> PAN["PathAngle · 2"]
+  MPPI --> PFW["PreferForward · 1"]
+`} />
+
+| Critic | Weight | What it buys |
+| --- | --- | --- |
+| `PathAlignCritic` | `14.0` | Dominant. Hug the global path, the controller's primary job. |
+| `ObstaclesCritic` | crit `20.0`, collision `10000` | Avoid lethal cells; `consider_footprint: false` keeps it cheap with the circular-robot approximation. |
+| `GoalCritic` | `5.0` | Pull toward the goal once inside `threshold_to_consider`. |
+| `PathFollowCritic` | `5.0` | Make progress along the path, not just parallel to it. |
+| `ConstraintCritic` | `4.0` | Respect the velocity/accel envelope. |
+| `GoalAngleCritic` | `3.0` | Square up the final heading for the tight yaw tolerance. |
+| `PathAngleCritic` | `2.0` | Penalise heading error against the path tangent. |
+| `PreferForwardCritic` | `1.0` | Dropped from the diff-drive default of `5.0` so MPPI does **not** bias away from a cleanly shorter sideways approach. |
+
+That low `PreferForwardCritic` weight is the holonomic philosophy in one number: the critic stays in the stack so a pure-lateral wiggle is not preferred when forward is equally good, but it is too weak to override a genuinely shorter strafe.
+
+The global planner is `nav2_navfn_planner/NavfnPlanner` (Dijkstra: `use_astar: false`, `allow_unknown: true`, `tolerance: 0.5`).
 
 ### Goal tolerance
 
-The goal checker (`nav2_controller::SimpleGoalChecker`) uses `xy_goal_tolerance: 0.25` and
-a tightened `yaw_goal_tolerance: 0.12` rad (~7°). The tight yaw tolerance frames the
-AprilTag head-on at the goal pose for the climate-data read.
+The goal checker (`nav2_controller::SimpleGoalChecker`) uses `xy_goal_tolerance: 0.25` and a tightened `yaw_goal_tolerance: 0.12` rad (~7°). The tight yaw tolerance exists for [perception](/docs/perception): it frames the AprilTag head-on at each per-tag approach pose so the climate-data read is clean, which couples this dial directly to the [mission](/docs/mission) approach-pose pipeline.
 
 <Callout type="warn">
-  If the tight yaw tolerance bites on hardware, MPPI iterating near the goal blowing the
-  navigation timeout, loosen `yaw_goal_tolerance` back toward `~0.18` rad.
+  The `0.12` rad tolerance can bite on hardware. MPPI iterating near the goal to hit ~7° can blow the navigation timeout, the documented fallback is to loosen `yaw_goal_tolerance` back toward `~0.18` rad. The trade is camera framing against approach reliability, and the comment in `nav2_params.yaml` flags both ends.
 </Callout>
 
 ## Costmaps for narrow aisles
 
-Both costmaps model the robot as a circle with `robot_radius: 0.22` at
-`resolution: 0.05`. The inflation is deliberately thin so plant-row aisles stay drivable:
+<Figure src="/screenshots/costmap-narrow-aisle-inflation.png" caption="Local costmap inflation comparison: a 0.55 m default halo fully closing a plant-row aisle vs the tuned 0.25 m radius / cost_scaling_factor 5.0 halo leaving a drivable lane down the middle." />
+
+Both costmaps model the robot as a circle with `robot_radius: 0.22` at `resolution: 0.05`. The inflation is deliberately thin so plant-row aisles stay drivable:
 
 | Parameter | Value | Rationale |
 | --- | --- | --- |
 | `robot_radius` | `0.22` | Circular footprint. |
-| `inflation_radius` | `0.30` | ~0.08 m clearance past the footprint; a 0.55 m halo would fully block a ~0.8 m aisle. |
+| `inflation_radius` | `0.25` | ~0.03 m clearance past the footprint; a 0.55 m halo would fully block a ~0.8 m aisle. |
 | `cost_scaling_factor` | `5.0` | Steep falloff keeps the halo thin so MPPI keeps drivable space mid-aisle. |
 | `always_send_full_costmap` | `False` | Publish incremental deltas, not the whole grid every cycle. |
 
-`always_send_full_costmap: False` is load-bearing on hardware: sending only changed cells
-cuts costmap publish bytes ~5–10× on KRR-house-scale maps, which keeps the Pi-side
-rosbridge JSON encoder below the threshold where it silently wedges.
+The inflation radius sits **barely above** the robot radius on purpose: at `0.25` m it leaves only ~0.03 m of true clearance past the 0.22 m footprint, betting on `cost_scaling_factor: 5.0` to make the cost falloff steep enough that MPPI threads the aisle on the low-cost spine rather than refusing to enter. A textbook 0.55 m halo on a 0.22 m robot would close a 0.8 m gap completely.
 
-The local costmap is a 3×3 m rolling window updating at `5.0` Hz with an `obstacle_layer`
-+ `inflation_layer` (laser-only in v1; the depth point cloud is available but not yet a
-costmap source). The global costmap adds a `static_layer` with
-`map_subscribe_transient_local: True` and tracks unknown space. Both clamp obstacle
-ranges to filter robot-body returns (`obstacle_min_range: 0.25`, `raytrace_min_range: 0.25`).
+`always_send_full_costmap: False` is load-bearing on hardware. A full-grid publish serialises the entire `OccupancyGrid` every cycle; on a KRR-house-scale map that is tens of thousands of cells JSON-encoded on the Pi, every publish, changed or not. Switching to incremental deltas cuts costmap publish bytes ~5-10×, and combined with the `slam_toolbox` `transform_publish_period` drop from 50 Hz to 10 Hz, these are the two bandwidth levers that keep the Pi-side rosbridge encoder below its [silent-wedge threshold](/docs/operations).
+
+### Local vs global obstacle ranges
+
+The two costmaps clamp obstacle ranges differently, and the asymmetry is intentional:
+
+| Range | Local | Global | Why they differ |
+| --- | --- | --- | --- |
+| `obstacle_max_range` | `2.5` | `5.0` | Local only needs the immediate window; global needs across-room coverage. |
+| `raytrace_max_range` | `3.0` | `12.0` | Global *clears* out to the full lidar reach but *marks* only to 5 m. |
+| `obstacle_min_range` | `0.25` | `0.25` | Both filter robot-body returns (sim lidar reports ~0.10 m hits on the arm). |
+
+Raw 12 m sim-lidar returns produce a noisy global costmap and costly publishes, so the global layer raytraces (clears) out to 12 m but only marks obstacles out to 5 m, which covers across-room geometry in the KRR house without the long-tail noise. The local costmap is a 3×3 m rolling window updating at `5.0` Hz with `obstacle_layer` + `inflation_layer` (laser-only in v1; `/camera/depth/points` exists but is not yet a costmap source). The global costmap adds a `static_layer` with `map_subscribe_transient_local: True` and tracks unknown space.
 
 ## The cmd_vel chain
 
-Nav2 never publishes to `/cmd_vel` directly. The smoothed output is remapped to
-`/cmd_vel_auto`, which feeds the lupin `twist_mux` as the lowest-priority (autonomy)
-input. Autonomy therefore goes through the exact same arbitration the Xbox dead-man and
-web HMI teleop use:
+Nav2 never publishes to `/cmd_vel` directly. The smoothed output is remapped to `/cmd_vel_auto`, which feeds the lupin `twist_mux` as the **autonomy** input, so autonomy goes through the exact same arbitration the Xbox dead-man and web HMI teleop use.
+
+<Mermaid chart={`graph LR
+  CS["controller_server"] -->|"/cmd_vel_nav"| VS["velocity_smoother"]
+  VS -->|"/cmd_vel_auto (prio 10)"| TM["twist_mux"]
+  JOY["/cmd_vel_joy (prio 100)"] --> TM
+  MAN["/cmd_vel_manual (prio 50)"] --> TM
+  ZERO["/zero_cmd_vel (prio 1, sim-only)"] --> TM
+  TM -->|"cmd_vel_out remap"| DRV["/mirte_base_controller/cmd_vel(_unstamped sim)"]
+`} />
+
+The inter-stage remaps are the part that trips readers: `controller_server` remaps its `cmd_vel` output to `/cmd_vel_nav`, `velocity_smoother` subscribes to `/cmd_vel_nav` and remaps its `cmd_vel_smoothed` output to `/cmd_vel_auto`. Publishing to a bare `/cmd_vel` would hit the vendor `gazebo_planar_move` teleport plugin in sim and bypass both the mux and the real mecanum controller, so the launch is explicit about never doing it.
+
+The smoother's 3-DOF limits `[vx, vy, wtheta]` mirror the full MPPI envelope, which is a **triple coupling** a tuner has to change together:
 
 ```text
-controller_server ──/cmd_vel_nav──▶ velocity_smoother ──/cmd_vel_auto──▶ twist_mux ──▶ drive controller
+MPPI            ax_max 2.5  ay_max 2.5  az_max 3.2   vx [0.5,-0.35]  vy ±0.5  wz 1.9
+velocity_smoother  max_accel [2.5, 2.5, 3.2]  max_decel [-2.5, -2.5, -3.2]
+velocity_smoother  max_velocity [0.5, 0.5, 1.9]  min_velocity [-0.35, -0.5, -1.9]
 ```
 
-- `controller_server` has its `cmd_vel` output remapped to `/cmd_vel_nav` (the
-  inter-stage hop).
-- `velocity_smoother` subscribes to `/cmd_vel_nav` and has its `cmd_vel_smoothed` output
-  remapped to `/cmd_vel_auto`.
+If MPPI samples outside the smoother's caps, the smoother chops the very trajectory MPPI just optimised and `PathAlign` drifts. The three sets, MPPI accel, smoother accel, and smoother velocity, must all mirror the MPPI velocity envelope, so changing the top speed means touching all three. See [Teleop & manual control](/docs/teleop) for the twist_mux priorities, where `/cmd_vel_auto` at priority `10` is the lowest *driving* input but **not** the absolute lowest, the sim-only `/zero_cmd_vel` idle guard sits at priority `1` to halt the Gazebo planar driver when every real input has timed out.
 
-The smoother's 3-DOF limits `[vx, vy, wtheta]` mirror the MPPI envelope:
-`max_velocity: [0.5, 0.5, 1.9]`, `min_velocity: [-0.35, -0.5, -1.9]`,
-`max_accel: [2.5, 2.5, 3.2]`. See [Teleop & manual control](/docs/teleop) for the
-twist_mux arbitration and priorities.
+## Sim and hardware parity
 
-## Sim/hardware parity
+Three params are aligned so the *same* config behaves identically in Gazebo and on the robot:
 
-Three params are aligned so the same config behaves identically in Gazebo and on the
-robot:
+- **`base_link` everywhere**, every node uses `base_link` as its base frame (`amcl.base_frame_id`, all `robot_base_frame`, slam_toolbox `base_frame`). The MIRTE URDF publishes no `base_footprint`.
+- **`odom_topic: /mirte_base_controller/odom`**, wheel-encoder odometry used by `bt_navigator`, `controller_server`, and `velocity_smoother`. This topic exists in both sim and hardware, unlike the sim-only teleport `/odom` feed.
+- **`min_laser_range: 0.25` m**, applied in AMCL (`laser_min_range`), slam_toolbox, and both costmaps to filter lidar returns hitting the robot's own body. `12.0` m matches the RPLidar A1 effective max.
 
-- **`base_link` everywhere**, every node uses `base_link` as its base frame
-  (`amcl.base_frame_id`, all `robot_base_frame`, slam_toolbox `base_frame`). The MIRTE
-  URDF publishes no `base_footprint`.
-- **`odom_topic: /mirte_base_controller/odom`**, wheel-encoder odometry, used by
-  `bt_navigator`, `controller_server`, and `velocity_smoother`. This topic exists in both
-  sim and on hardware, unlike the sim-only teleport `/odom` feed.
-- **`min_laser_range: 0.25` m**, applied in AMCL (`laser_min_range`), slam_toolbox, and
-  both costmaps to filter lidar returns hitting the robot's own body. `12.0` m matches the
-  RPLidar A1 effective max.
+The dormant AMCL path uses `nav2_amcl::OmniMotionModel` (a DiffDrive model would penalise the real lateral motion), with all five noise params `alpha1`-`alpha5` at `0.2` and `set_initial_pose: true` seeding belief at the vendor spawn pose (`x=1.0527, y=0.509611, yaw=0`) for headless restarts. To actually use it you would need `slam:=false` and a saved map served by `map_server`, the RViz **2D Pose Estimate** tool still reseeds at runtime.
 
-AMCL uses `nav2_amcl::OmniMotionModel` (a DiffDrive model would penalise the real lateral
-motion) and `set_initial_pose: true`, seeding belief at the vendor spawn pose
-(`x=1.0527, y=0.509611, yaw=0`) for headless restarts. The RViz **2D Pose Estimate** tool
-still works at runtime.
+### The map
+
+<Figure src="/screenshots/krr-house-saved-map.png" caption="The bundled krr_house.pgm occupancy grid (AWS small-house world, 0.05 m/cell) annotated with the AMCL seed pose and the global costmap inflation overlay." />
+
+`maps/krr_house.yaml` defines the AWS small-house ("KRR house") world at `resolution: 0.05`, `mode: trinary`, `origin: [-9.53, -4.68, 0]`, with `occupied_thresh: 0.65` / `free_thresh: 0.25`. The gotcha is that in slam mode this map is **never loaded**, `map_server` is not even instantiated, yet a real path is still required because `RewrittenYaml` substitutes `yaml_filename` into the params blob and a literal `''` makes the substitution explode. So `krr_house.yaml` is forwarded as a placeholder in every orchestrated launch purely to keep the YAML rewrite happy.
 
 ## SLAM configuration
 
-`config/slam_toolbox_sim.yaml` runs slam_toolbox in `mode: mapping` with the Ceres
-solver, `resolution: 0.05`, and `scan_topic: /scan`. The notable tuning is
-`transform_publish_period: 0.10` (10 Hz, down from the 50 Hz default):
+`config/slam_toolbox_sim.yaml` runs slam_toolbox in `mode: mapping` with the Ceres solver, `resolution: 0.05`, and `scan_topic: /scan`. Despite the `_sim` filename it is **shared** sim and hardware, only `use_sim_time` differs and that arrives as a launch arg, not a baked value. The notable tuning is `transform_publish_period: 0.10` (10 Hz, down from the 50 Hz default):
 
 <Callout type="info">
-  At 50 Hz the `map → odom` TF dominates DDS bandwidth and the Pi rosbridge encoder. 10 Hz
-  is plenty downstream, the local costmap runs at 5 Hz, the HMI map at ~5 Hz, and
-  controllers don't subscribe to `/tf`.
+  At 50 Hz the `map -> odom` TF dominates DDS bandwidth and the Pi rosbridge encoder. 10 Hz is plenty downstream, the local costmap runs at 5 Hz, the HMI map at ~5 Hz, and controllers do not subscribe to `/tf`. This is the second of the two bandwidth levers, paired with `always_send_full_costmap: False`, that keep the [rosbridge from wedging](/docs/operations).
 </Callout>
 
 ## Resetting the map
 
-slam_toolbox 2.6 (Humble) has no runtime "wipe map" service, `/slam_toolbox/clear_changes`
-only drops the localization edit buffer, not the scan-built occupancy grid. The
-`slam_reset_node` (entry point `slam_reset_node`) advertises a pragmatic operator service:
+`slam_toolbox` 2.6 (Humble) has **no** runtime "wipe map" service, `/slam_toolbox/clear_changes` only drops the localization edit buffer, not the scan-built occupancy grid. The pragmatic v1 erase is therefore a *process restart*, and the clever part is that it heals itself.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> Mapping
+  Mapping --> ClearingCostmaps: "Trigger /lupin/nav/clear_map"
+  ClearingCostmaps --> SigtermSlam: "fire-and-forget Empty to local + global clear"
+  SigtermSlam --> Down: "SIGTERM async_slam_toolbox_node"
+  Down --> Respawned: "respawn_delay 1.0 s"
+  Respawned --> Mapping: "empty pose graph, /map repopulates ~5-10 s"
+`} />
+
+The `slam_reset_node` advertises `/lupin/nav/clear_map` (`std_srvs/srv/Trigger`). On call it:
+
+<Steps>
+<Step>
+Fire-and-forget clears both costmaps via `/local_costmap/clear_entirely_local_costmap` and `/global_costmap/clear_entirely_global_costmap` (`std_srvs/srv/Empty`), so stale lethal cells do not linger inflated under the robot during the ~5-10 s slam_toolbox is down. Failures are logged, not propagated, the headline action is the kill.
+</Step>
+<Step>
+`pgrep -f async_slam_toolbox_node` to find every matching process (the pattern catches both the async and sync mappers), then `SIGTERM` them all. The `Trigger` response reports the count killed.
+</Step>
+</Steps>
 
 ```bash
 ros2 service call /lupin/nav/clear_map std_srvs/srv/Trigger {}
 ```
 
-On call it:
-
-1. Best-effort clears both costmaps via
-   `/local_costmap/clear_entirely_local_costmap` and
-   `/global_costmap/clear_entirely_global_costmap` (`std_srvs/srv/Empty`, fire-and-forget,
-   so stale lethal cells don't linger under the robot).
-2. Sends `SIGTERM` to every process matching `async_slam_toolbox_node`.
-
-The Trigger response reports how many processes were killed. This relies on slam_toolbox
-being launched with `respawn=True` so it comes back with an empty pose graph and starts
-mapping from scratch (~5–10 s). The web HMI's **Erase map** button calls this same
-service.
+The whole trick depends on `respawn=True` + `respawn_delay=1.0` on the `slam_toolbox` Node in `_slam_core.launch.py` (and the same in `hardware.launch.py`). SIGTERM the process and respawn brings it back ~1 s later with an empty pose graph, mapping from scratch. This is exactly why the launch spawns `slam_toolbox` as a direct `Node`, **not** via the upstream `online_async_launch.py`, which has no respawn knob and would leave the kill permanently dead. The web HMI's **Erase map** button calls this same service.
 
 <Callout type="warn">
-  Because the reset works by killing and respawning the slam_toolbox *process*, it only
-  applies in SLAM mode (`slam:=true`). It does not reset a saved map served by `map_server`.
+  Because the reset works by killing and respawning the slam_toolbox *process*, it only applies in slam mode. It does **not** reset a saved map served by `map_server`, that path has no live process to kill.
 </Callout>
 
 ## See also
@@ -237,6 +281,6 @@ service.
 <Cards>
   <Card title="Mission orchestrator" href="/docs/mission">The state machine that issues NavigateToPose goals and per-tag approach poses.</Card>
   <Card title="Teleop & manual control" href="/docs/teleop">The twist_mux that arbitrates `/cmd_vel_auto` against gamepad and HMI input.</Card>
-  <Card title="Architecture" href="/docs/architecture">Where Nav2 sits in the node/topic graph and the sim ↔ hardware boundary.</Card>
-  <Card title="Operations" href="/docs/operations">Bring-up order, the rosbridge wedge failure mode, and recovery.</Card>
+  <Card title="Operations" href="/docs/operations">Bring-up order, the sentinel cascade, the rosbridge wedge, and recovery.</Card>
+  <Card title="War stories" href="/docs/war-stories">The bond_timeout, Invalid frame ID, and map-erase debugging sessions in full.</Card>
 </Cards>

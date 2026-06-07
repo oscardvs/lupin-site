@@ -9,6 +9,7 @@ import { File, Folder, Files } from 'fumadocs-ui/components/files';
 import { Video, YouTube } from '@/components/media';
 import { ScreenGallery } from '@/components/gallery';
 import { Mermaid } from '@/components/mermaid';
+import { Figure } from '@/components/figure';
 
 export function getMDXComponents(components?: MDXComponents) {
   return {
@@ -28,6 +29,7 @@ export function getMDXComponents(components?: MDXComponents) {
     YouTube,
     ScreenGallery,
     Mermaid,
+    Figure,
     ...components,
   } satisfies MDXComponents;
 }

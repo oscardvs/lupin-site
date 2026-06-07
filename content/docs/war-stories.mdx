@@ -1,0 +1,165 @@
+---
+title: War stories
+description: The lived-in Lupin debugging sagas, the wheels that free-spin from a wedged telemetrix board, the 180-degree base frame fixed by a matched pin-swap, the e-stop wired to nothing until estop_bridge, the five layered boot races behind one dead robot, the WiFi roam that masquerades as dead controllers, the multi-homed robot advertising an unroutable DDS locator, the shoulder_lift servo cooking itself against gravity, and the HMI zero-heartbeat that out-votes every drive path.
+---
+
+These are the scars that taught the design. Every hard-won default in the Lupin stack, the matched pin-swap, the `estop_bridge`, the clock-sync-before-ROS rule, the priority-100 `/cmd_vel_joy` isolation step, exists because a robot once sat dead on a bench and the obvious diagnosis was **wrong**. This page is the story behind the runbook, told as the sagas actually unfolded: the false leads, the real cause, the fix, and the one line each one burned in.
+
+Read [Operations](/docs/operations) for the terse symptom-cause-fix triage table, [Networking](/docs/networking) for the DDS mechanisms underneath the comms failures, [Hardware](/docs/hardware) for the motor and servo internals, and [Design decisions](/docs/design-decisions) for *why* the fixes landed where they did instead of where they first seemed to belong.
+
+<Figure src="/war-stories/bench-debug.jpg" caption="Mirte-247264 on the bench mid-debug: wheels off the ground, USB telemetrix board exposed, the laptop showing five controllers active over a robot that would not move." />
+
+## The wheels that would not turn
+
+**Symptom.** The robot refuses to drive from anything, the HMI joystick, a raw `/cmd_vel_manual` pub, even the highest-priority `/cmd_vel_joy`. Yet `ros2 control list_controllers` swears every controller is `active`, `/joint_states` streams a clean 10 Hz, the battery reads full, and the e-stop button is physically out.
+
+The first instinct is to chase software, because software is what you can see. We checked `twist_mux` arbitration, re-sourced the DDS env, restarted `mirte-ros`, and every layer reported healthy. The lie was the word `active`. `systemctl is-active` and `ros2 control list_controllers` report *lifecycle* state, **not** whether the real-time loop is pushing current into the motors.
+
+**Cause.** The telemetrix motor-driver board had **wedged**. Its MCU runs on logic and USB power, so it keeps reading encoders, which is exactly why `/joint_states` stayed healthy and every controller reported `active`, while the H-bridge output went dead and *un-energized*. The control graph was talking to a corpse that still answered the phone.
+
+**Fix.** Feel the wheels by hand *first*. If they spin freely the motors are un-energized, a real PID fault would still hold and energize the joint against you. A free spin means the board is wedged, and only a genuine **hard power-cycle** clears it: main switch off for about 15 s, then on. A soft reboot or `systemctl restart mirte-ros` keeps the USB-powered telemetrix board alive across the restart and changes nothing.
+
+<Callout type="info">
+  **Lesson.** "Controllers active" is a statement about the lifecycle graph, not about hardware. Free-spinning wheels mean the motor board is wedged, and a cold power-cycle is the only revival. The same day this bit, a latched HMI e-stop was *also* masking the symptom, see [the HMI zero-heartbeat](#the-hmi-that-silently-blocks-every-drive-path) below, which is why the isolation order matters.
+</Callout>
+
+## Backwards robot, right-looking map
+
+**Symptom.** Forward commands drove the chassis physically backward. The SLAM map built clean but came out rotated, RViz showed motion going the wrong way, and yet *nothing* in the graph disagreed with itself. Every frame was internally consistent, just mirrored from the real chassis.
+
+This is the seductive kind of bug, because the system is self-consistent. We first patched it where it hurt: a sign flip in the HMI joystick scaling and a matching inversion on the Xbox axes. The robot drove right with the HMI open, then drove backward again the instant a raw `/cmd_vel` test bypassed the HMI. We were *double-compensating*, fixing the symptom at two surfaces while the source stayed broken.
+
+**Cause.** Mirte-247264's mecanum base was wired with motor and encoder leads physically reversed *in pairs*, so the entire `base_link` frame, the loop of `cmd_vel` to `odom` to lidar, was consistent but rotated **180 degrees** about Z from the physical chassis. Odometry and the map agreed with each other and lied to the world.
+
+**Fix.** A **matched pin-swap** in the telemetrix config for all four wheels: swap both motor pins `p1` and `p2` *and* both encoder pins `A` and `B`, per wheel. That cancels the lead-reversal at the firmware-facing layer, so every downstream consumer becomes correct automatically and the HMI and Xbox compensation flips were retired. The non-negotiable part: motor and encoder must be swapped *together* per wheel. Motor-only or encoder-only is **positive feedback**, a runaway wheel that pins itself the instant it twitches. Always bench-test wheels-off-ground.
+
+<Callout type="warn">
+  **Lesson.** Fix frame inversion at the *source*, not with downstream flips that double-compensate and lie to the next subsystem. And swap motor plus encoder together, or you have built a runaway feedback loop. See [Hardware](/docs/hardware) for the per-wheel telemetrix pin map.
+</Callout>
+
+## The e-stop wired to nothing
+
+**Symptom.** Pressing the physical emergency button, or the HMI STOP button, did **not** freeze the mission state machine, did not cancel an in-flight autonomous Nav2 goal, and did not force the LEDs red. The base might stop teleop driving, but the controller kept executing a live `NavigateToPose`. The single most dangerous failure in the whole stack: a safety control that did nothing.
+
+The orchestrator *looked* correct. Its `EStopMonitor` subscribed to `/e_stop_state` (`std_msgs/Bool`), the variable was read, the FAULT branch was wired. A single-file review passes this every time.
+
+**Cause.** Nothing in production ever *published* `/e_stop_state`. A whole-tree grep found exactly one publisher, the unit-test fixture. The real button publishes `/io/intensity/emergency_button/digital` (`mirte_msgs/IntensityDigital`, **not** `Bool`) with zero subscribers, and the HMI STOP was a client-side `cmd_vel`-zeroing gate that never reached the orchestrator at all. The interlock was decorative, broken across a cross-process seam that no single file shows.
+
+**Fix.** A new node, `lupin_hmi/estop_bridge`. It subscribes the physical button *and* the HMI soft-stop `/lupin/hmi/estop`, and publishes their boolean **OR** onto `/e_stop_state` at 5 Hz, wired into `onboard.launch.py` so it comes up with the robot. The orchestrator's monitor finally has a real producer feeding it.
+
+<Callout type="warn">
+  **Remaining.** The button polarity (the `engaged_value` param) is still not hardware-verified. Press the real button on the bench and confirm `/e_stop_state` goes `true`, not `false`, before trusting it in a demo. A producer that publishes the *inverted* signal is as dangerous as no producer at all.
+</Callout>
+
+**Lesson.** A safety interlock is only real if a producer actually feeds it. Autonomous e-stop was a comment in the code until `estop_bridge` wired the physical button to `/e_stop_state`. See [Mission](/docs/mission) for how FAULT propagates once the signal is real.
+
+## Five layered bugs behind one dead robot
+
+**Symptom.** After a cold boot the controllers sat permanently `unconfigured`. `cmd_vel` reached the controller topic and was silently dropped, the wheels stayed dead, and a manual `systemctl restart mirte-ros` refused to recover it, crashing with `A controller named X was already loaded`.
+
+This was not one bug. It was **five** independent races stacked so neatly they presented as a single symptom, and the trap was that *any* one of them, fixed alone, left the robot still dead, which made every individual fix look wrong. The only way through was to stop patching and read the boot journal end-to-end with `-o short-monotonic`, lay the timeline out, and name every race before touching anything.
+
+<Mermaid chart={`
+graph TD
+  B1["1 Chrony gate<br/>times out, proceeds anyway, +30 s wasted"]
+  B2["2 mirte_ros.sh forks fastdds discovery<br/>no bind check"]
+  B3["3 Discovery server loses port 11811<br/>RTNETLINK noise, no retry"]
+  B4["4 lupin-onboard ProtectSystem strict<br/>blocks writing super_client_config.xml"]
+  B5["5 Vendor spawner hangs<br/>controller_manager missing, restart says already loaded"]
+  DEAD["One dead robot<br/>controllers unconfigured, wheels silent"]
+  B1 --> B2 --> B3 --> B4 --> B5 --> DEAD
+`} />
+
+**Cause.** In order of fire: (1) a chrony-synced gate that timed out and "proceeded anyway", adding 30 s of boot delay for nothing; (2) the vendor `mirte_ros.sh` forking `fastdds discovery` without ever checking that it bound; (3) the discovery server losing the bind race against early-boot RTNETLINK noise on port 11811, with no retry; (4) `lupin-onboard.service`'s `ProtectSystem=strict` blocking the env script from writing `super_client_config.xml`, so every participant came up pointed at a server it could not configure; and (5) the vendor spawner hanging forever on the missing `controller_manager` service, then crashing on restart because the controllers were stuck in `already loaded`.
+
+**Fix.** Remove the chrony gate. Replace it with a dedicated discovery-server systemd unit that *owns* port 11811. Strip `ProtectSystem=strict` from `lupin-onboard` so the env script can write its config. Critically, do **not** add a "safer" dependency gate that masks the underlying race, one such gate added blind created an ordering cycle that systemd silently dropped, a sixth bug born from trying to fix the first five.
+
+<Callout type="info">
+  **Lesson.** When a system fails at boot, read the journal with timestamps and name every layered race *before* patching. A "safer" gate added blind usually masks the real bug and adds a new one. See [Operations](/docs/operations) for the event-driven cascade that replaced the old sleep-and-hope ordering.
+</Callout>
+
+## It looks like dead controllers, check your own WiFi first
+
+**Symptom.** Mid-session the robot "stopped driving" from both the HMI and the Xbox pad, `arm_teleop` lost `/joint_states`, and the robot's discovery server flooded `[DISCOVERY_DATABASE Error] Matching unexisting participant`. It looked *exactly* like `controller_manager` dying under us.
+
+Everything pointed at the robot. So we SSH'd in to restart the stack, and the SSH itself was slow in a telling way: it returned `No route to host`, not a timeout. That one word is the whole diagnosis.
+
+**Cause.** The laptop's WiFi had silently **roamed** off the robot AP (Mirte-247264) onto eduroam, because both were saved NetworkManager profiles with `autoconnect=yes` and equal priority 0. One radio cannot hold both networks, and when it landed on eduroam the `192.168.42.0/24` route vanished and every laptop-side participant dropped off the net. All five controllers stayed `active` the entire time. The robot was simply *unreachable*.
+
+**Fix.** Diagnose from the laptop **first**. `ssh lupin` returning `No route to host` (not `timeout`) is the link-layer tell, then `ip route get 192.168.42.1` and `nmcli dev status` confirm it. Recover with `nmcli connection up Mirte-247264`, and do **not** bounce `mirte-ros`, which would only paper over a network problem with a robot restart. The durable fix pins the robot AP with `connection.autoconnect-priority 100` so the laptop never wanders off it again.
+
+<Callout type="warn">
+  **Lesson.** When everything dies at once, suspect the *laptop's* network before the robot. A WiFi roam masquerades perfectly as dead controllers, and the `ros2` CLI's own "no data" quirks will happily lead you deeper down the wrong hole. See [Networking](/docs/networking) for the autoconnect-priority pin.
+</Callout>
+
+## The robot that advertised an address nobody could reach
+
+**Symptom.** On the wired link, laptop-to-robot DDS *silently* failed: the base would not drive, arm services and `ros2 control list_controllers` timed out. But robot-to-laptop worked fine, the HMI showed live telemetry and `/scan` echoed, and discovery worked, the robot could see the laptop's topics. A perfectly *one-way* break.
+
+That asymmetry is the entire fingerprint. Discovery up, telemetry flowing one way, commands dropping the other way. It is not a firewall (which blocks symmetrically), not the laptop (whose pubs were healthy), not shared memory (this was wired). It is a routing lie.
+
+**Cause.** The robot was **dual-homed**: `eth0` (wired, `10.42.0.1`) *and* `wlan0` still running its AP at `192.168.42.1`. Its participants advertised the `192.168.42.1` locator, which the laptop has no route to, so the peer-to-peer data channel never established. Discovery survived because it rides the `0.0.0.0:11811` discovery server, which the laptop *can* reach, and best-effort sensor streams masked the one-way break by flowing over the channels that did come up.
+
+<Mermaid chart={`
+graph LR
+  subgraph laptop["LAPTOP (10.42.0.2)"]
+    LP["Nav2 + arm clients"]
+  end
+  subgraph robot["ROBOT (dual-homed)"]
+    DS["discovery server<br/>0.0.0.0:11811"]
+    PART["participants advertise<br/>192.168.42.1 (AP locator)"]
+  end
+  LP -->|"discovery + metadata, reachable"| DS
+  DS -->|"announces unroutable locator"| LP
+  LP -.->|"data channel to 192.168.42.1, NO ROUTE"| PART
+  PART -->|"best-effort scan over eth0, masks the break"| LP
+`} />
+
+**Fix.** Single-home the robot on `eth0`: `systemctl disable --now mirte-ap mirte-wifi-watchdog && reboot`. A clean reboot fully fixes it, while flushing the IP on a live graph only half-works because the discovery server keeps the stale locators in its database. For demos that want the AP kept as a fallback, pin FastDDS to `eth0` via `interfaceWhiteList` instead of disabling the AP.
+
+<Callout type="info">
+  **Lesson.** A multi-homed robot poisons DDS by advertising an unroutable locator. One-way comms that work for *discovery* but not *data* are the signature, never debug it as a symmetric firewall or a laptop problem. See [Networking](/docs/networking) for the `interfaceWhiteList` pin.
+</Callout>
+
+## The servo that cooks itself against gravity
+
+**Symptom.** `shoulder_lift` ignored commands while every other arm joint worked. The joint *above* it, the elbow, moved instead, there was a faint electric noise, and the servo might or might not feel hot. Position readback still streamed, but the arm sagged free under gravity.
+
+The "elbow moves instead" detail sent us hunting for a joint swap in the URDF, a unit error, a wiring crossover. None of that was real. The position readback working at all is what rules out a dead servo.
+
+**Cause.** The Hiwonder `shoulder_lift` servo (HTD-45H) is **torque-marginal**. Lifting the arm against gravity it stalls at about 3.8 A, *below* the 5 A config cap, so it is the servo's own internal protection ceiling, not ours, pulling current with zero motion. It over-currents, **unloads** (torque drops to zero), and the joint goes back-drivable, which is why the arm sags. The older, nastier variant is a full thermal **latch** where commands are ignored entirely. This is not undervoltage, not the software path, not a dead servo.
+
+**Fix.** An unloaded servo re-loads *without* a power-cycle via `/io/servo/hiwonder/shoulder_lift/set_enable true` (or `enable_all_servos`). A full thermal latch needs a hard power-cycle. Disambiguate the two by reading the per-joint error in `controller_state`: a torque-marginal stall sits below the current cap and unloads, a JTC fault holds error. Mitigate by auto-homing to a low-gravity-moment pose on boot, keeping the battery full (Hiwonder torque scales with voltage), and never parking the arm extended between sessions.
+
+<Callout type="warn">
+  **Lesson.** Disambiguate the trip from a JTC fault via the per-joint `controller_state` error. A torque-marginal servo stalls *below* its current cap and unloads, so re-enable torque to recover and power-cycle only if it is fully latched. See [Hardware](/docs/hardware) for the arm servo map and the auto-home pose.
+</Callout>
+
+## The HMI that silently blocks every drive path
+
+**Symptom.** The robot would not drive, not from the HMI joystick, and *not even* from a raw terminal `ros2 topic pub` straight to the controller's own topic. Worse, alt-tabbing to a terminal to test made it actively worse.
+
+The "raw terminal pub fails too" detail is what makes this so vicious. Bypassing the HMI is supposed to be the clean isolation test, and here the HMI poisons even that.
+
+**Cause.** `lupin_web`'s `estop.tsx` boots with the e-stop **engaged** (the `startup` state). While engaged it publishes a 20 Hz **zero** `Twist` heartbeat to `/cmd_vel_manual`, and `twist_mux` (manual priority 50) relays those zeros to the base controller, *out-voting* a 10 Hz raw manual pub. Worse still, `estopAutoOnFocusLoss` defaults `true`, so switching to a terminal fires `window`-blur and **re-latches** the e-stop, which is exactly why a terminal raw-drive test silently fails while the HMI tab is unfocused.
+
+**Fix.** Click **Reset E-stop** before driving. For hands-off or tabbed demos, disable Settings then Safety then "Auto E-stop on focus loss". But always isolate the *controller and motor layer* (the priority-100 `/cmd_vel_joy`, the wheels-by-hand check) **before** blaming the HMI. On the day this bit, it was only a secondary masker stacked on top of a [wedged motor board](#the-wheels-that-would-not-turn), which is the whole reason the isolation order is law.
+
+<Callout type="info">
+  **Lesson.** A safety-by-default zero-heartbeat through `twist_mux` means an open HMI can silently out-vote *every* other drive path, including raw terminal commands. Test the motor layer with priority-100 `/cmd_vel_joy` before you ever suspect the browser. See [Teleop](/docs/teleop) for the `twist_mux` priority table.
+</Callout>
+
+## The pattern behind the scars
+
+Read together, these sagas rhyme. Four of them, the wheels, the WiFi roam, the multi-homing, the rosbridge wedge in the [operations runbook](/docs/operations), share one shape: a layer reports **healthy** while the layer below it is dead, and the green light is a lie about something it cannot actually see. The fixes that stuck all moved the truth *down* a level, feel the wheels, read `No route to host`, check the advertised locator, watch the per-joint current. The fixes that failed all tried to compensate *up* a level, the HMI sign flip, the "safer" boot gate, the soft restart.
+
+<Figure src="/war-stories/triage-flow.png" caption="The Lupin triage order distilled from these stories: physical layer first (wheels, power, network route), then DDS graph, then the application, never the reverse." />
+
+## See also
+
+<Cards>
+  <Card title="Operations & troubleshooting" href="/docs/operations">The terse symptom-cause-fix triage table and the boot-time self-heal.</Card>
+  <Card title="Deploy & networking" href="/docs/networking">The FastDDS discovery server, locators, and AP pinning behind the comms failures.</Card>
+  <Card title="Hardware" href="/docs/hardware">The telemetrix pin map, the mecanum base, and the Hiwonder arm servos.</Card>
+  <Card title="Design decisions" href="/docs/design-decisions">Why the fixes landed at the source rather than the surface.</Card>
+</Cards>

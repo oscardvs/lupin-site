@@ -1,56 +1,86 @@
 ---
 title: Mission orchestrator
-description: A single ROS 2 node drives a hierarchical state machine over Nav2 and the greenhouse bridge to run inspection and frontier-exploration missions.
+description: A single rclpy node drives a hierarchical state machine over Nav2 and the greenhouse bridge to run InspectionMission and ExplorationMission patrols, with a battery-low dock-and-resume subsystem, frontier exploration, per-tag approach geometry, two localization gates, flag-based pause/E-stop/battery preemption, operator pause/resume/abort/skip/dock/reset services, and typed MissionState and Observation telemetry.
 ---
 
-The mission orchestrator is the brain of a Lupin run. One `rclpy` node (`mission_orchestrator`, in `lupin_mission/node.py`) owns a hierarchical state machine built on the [`transitions`](https://github.com/pytransitions/transitions) library, drives [Nav2](/docs/navigation) through tag-based greenhouse routines, calls the [greenhouse bridge](/docs/greenhouse-bridge) for each tag reading, and broadcasts every result as a typed `lupin_msgs/Observation` so the [digital twin](/docs/digital-twin) and [web console](/docs/web-hmi) react in real time.
+The mission orchestrator is the **brain** of a Lupin run, one `rclpy` node (`mission_orchestrator`, in `lupin_mission/node.py`) that owns a hierarchical state machine, drives [Nav2](/docs/navigation) through tag-based greenhouse routines, calls the [greenhouse bridge](/docs/greenhouse-bridge) for each reading, watches the battery and the E-stop, and broadcasts every result as a typed `lupin_msgs/Observation` so the [digital twin](/docs/digital-twin) and [web console](/docs/web-hmi) react in real time. It is the seam where navigation, perception, and the operator's intent meet.
+
+This page is the reference for that node, the lifecycle graph and the shared scan sub-machine, the two mission types, the frontier explorer, the approach geometry, the localization gates, the pause/E-stop/battery flag model, the battery-low dock-and-resume subsystem, the operator services, the telemetry contracts, and the failure policy. The state machine is built on the [`transitions`](https://github.com/pytransitions/transitions) library and lives in a pure-data spec so the docs and tests can build it without standing up ROS.
+
+<Figure src="/photos/mission-greenhouse-run.jpg" caption="Mirte-247264 mid-inspection at a greenhouse table, parked at the standoff pose facing an AprilTag with the front Orbbec framing it." />
 
 It does **not** auto-run on bring-up. The node idles in `READY` and is driven entirely by operator services, `/mission/start` is the only thing that puts it to work.
 
 ## The lifecycle
 
-The top-level state machine walks a fixed lifecycle. `PREPARE` branches to one of two working states by mission type, `EXPLORING` (ExplorationMission) or `INSPECTING` (InspectionMission), and `FAULT` is reachable from anywhere and terminal. `MONITORING` is not entered directly from `PREPARE`; an `ExplorationMission` reaches it from `EXPLORING` once enough tags are discovered.
+The top-level state machine walks a fixed lifecycle. `PREPARE` branches to one of two working states by mission type, `EXPLORING` (ExplorationMission) or `INSPECTING` (InspectionMission). `MONITORING` is reached only from `EXPLORING`, once enough tags are discovered. `RETURNING` drives the dock pose and, in the battery and manual-dock cases, can route *back* into the family it left rather than always ending. `FAULT` is reachable from anywhere but, unlike v1, it is **no longer strictly terminal**, `/mission/reset` clears it.
 
-```text
-                          ┌─ (InspectionMission) ─► INSPECTING ─┐
-BOOT ─► READY ─► PREPARE ──┤                                    ├─► RETURNING ─► DONE
-                          └─ (ExplorationMission) ► EXPLORING   │
-                                                       └─► MONITORING ◄┘ (loops)
-                       │                                          │
-                       └──────────► (FAULT) ◄────────────────────┘
-                                                                  │
-                                                                  └──► READY (next)
-```
+<Mermaid chart={`
+stateDiagram-v2
+  [*] --> BOOT
+  BOOT --> READY: deps_up
+  READY --> PREPARE: start_mission
+  PREPARE --> EXPLORING: localized (exploration)
+  PREPARE --> INSPECTING: localized (inspection)
+  EXPLORING --> MONITORING: tags_discovered
+  EXPLORING --> MONITORING: no_frontiers (any found)
+  EXPLORING --> RETURNING: no_frontiers (none)
+  INSPECTING --> RETURNING: inspection_complete
+  MONITORING --> RETURNING: inspection_complete
+  INSPECTING --> RETURNING: abort_to_return
+  MONITORING --> RETURNING: abort_to_return
+  EXPLORING --> RETURNING: abort_to_return
+  PREPARE --> RETURNING: abort_to_return
+  RETURNING --> INSPECTING: resume_inspection
+  RETURNING --> MONITORING: resume_monitoring
+  RETURNING --> EXPLORING: resume_exploration
+  RETURNING --> DONE: returned
+  DONE --> READY: reset_for_next
+  FAULT --> READY: recover
+  PREPARE --> FAULT: fault
+  RETURNING --> FAULT: fault
+  DONE --> [*]
+`} />
 
 | State | What happens |
 |---|---|
-| `BOOT` | Wait up to `dependency_timeout_s` (default `30.0`) for the Nav2 action server and the bridge service (plus `/perception/confirm_tag` if the visual gate is on). Timeout → `FAULT`. |
+| `BOOT` | Poll for the Nav2 action server and the bridge service until both are up, then `deps_up`. With `require_visual_confirmation` on, `/perception/confirm_tag` is a **hard** boot dependency too, the node refuses to leave `BOOT` without it. Timeout past `dependency_timeout_s` (default `30.0`) goes to `FAULT`. |
 | `READY` | Idle. Accepts `/mission/start`. |
 | `PREPARE` | Wraps a single `LOCALIZING` child, gates on AMCL covariance before any goal is sent. |
 | `EXPLORING` | Frontier-explore the live SLAM `/map` until `discovery_goal` distinct tags are seen. *ExplorationMission only.* |
-| `INSPECTING` | Per-tag `NAVIGATING → SCANNING → PUBLISHING` loop over a fixed tag list, once through. |
-| `MONITORING` | Same sub-machine as `INSPECTING`, but loops forever over discovered tags. *ExplorationMission only.* |
-| `RETURNING` | Drive the `dock_pose` (default `[0.0, 0.0, 0.0]`). Nav failure here is non-fatal, still `→ DONE`. |
+| `INSPECTING` | Per-tag `NAVIGATING -> SCANNING -> PUBLISHING` loop over a fixed tag list, once through. |
+| `MONITORING` | Same sub-machine as `INSPECTING`, sweeping the discovered tags for `monitoring_sweeps` cycles. *ExplorationMission only.* |
+| `RETURNING` | Drive the `dock_pose` (default `[0.0, 0.0, 0.0]`, the map origin, or the mission start pose if left unset). Outcome depends on *why* the robot is returning, see the dock decision tree below. |
 | `DONE` | Logs a summary. A fresh `/mission/start` bounces through `READY` for the next mission. |
-| `FAULT` | Terminal. The node stays alive for introspection but rejects future starts. |
+| `FAULT` | The node stays alive for introspection and rejects future starts, but `/mission/reset` fires `recover` and returns it to `READY` without a process restart. |
 
-The HSM topology lives in a pure-data free function, `build_hsm_spec()` (`node.py:98`), so the docs/diagram exporter can build it without standing up a ROS node. Nested states use the default `_` separator from `transitions`, so e.g. the navigating sub-state of inspection is `INSPECTING_NAVIGATING`.
+The HSM topology lives in a pure-data free function, `build_hsm_spec()` (`node.py:100`), so the docs/diagram exporter can build it without a ROS node. Nested states use the default `_` separator from `transitions`, so the navigating sub-state of inspection is `INSPECTING_NAVIGATING`.
 
 ### The shared scan sub-machine
 
-`INSPECTING` and `MONITORING` use the *exact same* `NAVIGATING → SCANNING → PUBLISHING` sub-machine. The on-enter handlers for both delegate to the same `_enter_navigating` / `_enter_scanning` / `_enter_publishing` methods.
+`INSPECTING` and `MONITORING` use the *exact same* `NAVIGATING -> SCANNING -> PUBLISHING` sub-machine, both delegate their on-enter handlers to the same `_enter_navigating` / `_enter_scanning` / `_enter_publishing` methods.
 
-```text
-NAVIGATING ──nav_succeeded──► SCANNING ──scan_done──► PUBLISHING ──next_tag──► NAVIGATING
-     │                                                     │
-     └──nav_unreachable──────────────────────────────────►┘──inspection_complete──► RETURNING
-```
+<Mermaid chart={`
+stateDiagram-v2
+  [*] --> NAVIGATING
+  NAVIGATING --> SCANNING: nav_succeeded
+  NAVIGATING --> PUBLISHING: nav_unreachable
+  SCANNING --> PUBLISHING: scan_done
+  PUBLISHING --> NAVIGATING: next_tag
+  PUBLISHING --> RETURNING: inspection_complete
+  state SCANNING {
+    [*] --> CONFIRMING: visual gate on
+    CONFIRMING --> READING: detected
+    READING --> DWELL: bridge ok
+    DWELL --> [*]: dwell elapsed
+  }
+`} />
 
-- **NAVIGATING** issues `NavigateToPose` for the current tag's approach pose, with retry up to `nav_max_attempts` (default `2`, total attempts, *not* retries).
-- **SCANNING** calls the greenhouse bridge (and, on hardware, `/perception/confirm_tag` first).
-- **PUBLISHING** is a named advance gate: the observation was already published upstream; here the cursor advances and the machine fires `next_tag` or `inspection_complete`.
+- **NAVIGATING**, issues `NavigateToPose` for the current tag's approach pose, with retry up to `nav_max_attempts` (default `2`, total attempts, *not* retries). With arm patrol on it first folds the arm to the travel preset and waits `arm_travel_settle_s` before driving.
+- **SCANNING**, calls the greenhouse bridge, optionally `/perception/confirm_tag` first (surfaced as `CONFIRMING`), strikes the arm inspect preset, and holds `flower_scan_dwell_s` after a good reading so the flower detector can classify the bloom.
+- **PUBLISHING**, a named advance gate, the observation was already published upstream, here the cursor advances and the machine fires `next_tag` or `inspection_complete`.
 
-The *only* behavioural difference between the two missions is the cursor. `InspectionMission`'s cursor runs out, so `is_complete()` eventually returns true and `PUBLISHING` fires `inspection_complete` → `RETURNING`. `MonitoringMission`'s cursor wraps modulo the tag count and `is_complete()` stays false forever, so `PUBLISHING` always fires `next_tag`. The loop only ends when the operator pauses or aborts.
+The *only* behavioural difference between the two missions is the cursor. `InspectionMission`'s cursor runs out, so `is_complete()` eventually returns true and `PUBLISHING` fires `inspection_complete` -> `RETURNING`. `MonitoringMission`'s cursor *wraps* modulo the tag count and bumps a sweep counter, so `is_complete()` stays false until `monitoring_sweeps` full sweeps are done. By default `monitoring_sweeps` is `1`, so monitoring visits each discovered tag **once** and returns, raise the param for a true continuous patrol. The loop also ends early on pause or abort.
 
 ## The two mission types
 
@@ -89,33 +119,46 @@ ros2 service call /mission/start lupin_msgs/srv/StartMission \
 
 ### ExplorationMission
 
-`PREPARE` branches to `EXPLORING`: the orchestrator frontier-explores the live SLAM `/map` until `/perception/discovered_tags` reports `discovery_goal` distinct tag ids, then transitions to `MONITORING` and re-scans those tags continuously. If the request's `discovery_goal` is `0`, the orchestrator's `discovery_goal` parameter default (`5`) is used; a non-positive resolved goal is rejected.
+`PREPARE` branches to `EXPLORING`, the orchestrator frontier-explores the live SLAM `/map` until `/perception/discovered_tags` reports `discovery_goal` distinct tag ids, then transitions to `MONITORING` and re-scans those tags. If the request's `discovery_goal` is `0`, the orchestrator's `discovery_goal` parameter default (`5`) is used, a non-positive resolved goal is rejected.
 
 ```bash
 ros2 service call /mission/start lupin_msgs/srv/StartMission \
   "{mission_type: 'ExplorationMission', discovery_goal: 5}"
-# EXPLORING (drives to frontiers) → MONITORING (loops over the found tags)
+# EXPLORING (drives to frontiers) -> MONITORING (sweeps the found tags)
 # /mission/abort stops the loop and returns home.
 ```
 
-A hard `exploration_timeout_s` (default `180.0`) bounds the search. On lapse, the machine switches to `MONITORING` if any tags were found, otherwise straight to `RETURNING`.
+A hard `exploration_timeout_s` (default `180.0`) bounds the search. On lapse, the machine switches to `MONITORING` if any tags were found, otherwise straight to `RETURNING`. When the frontier explorer runs out of reachable boundary it fires `no_frontiers`, which routes the same way.
 
 <Callout type="info">
-  The user-facing `mission_type` in `/mission/state` stays `"ExplorationMission"` across the `EXPLORING → MONITORING` handoff even though the underlying model object swaps from `ExplorationMission` to `MonitoringMission`.
+  The user-facing `mission_type` in `/mission/state` stays `"ExplorationMission"` across the `EXPLORING -> MONITORING` handoff even though the underlying model object swaps from `ExplorationMission` to `MonitoringMission`. The HMI should never see the internal `MonitoringMission` name.
 </Callout>
+
+The monitoring sweep is not arbitrary order. `order_tags_nearest_first()` (`exploration_mission.py:22`) runs a greedy nearest-neighbour from the robot's start pose over the discovered tags, so the sweep is a coherent path instead of a zig-zag, and falls back to a deterministic numeric tag-id sort when a discovered pose lacks an `(x, y)`.
 
 ## The frontier explorer
 
-`frontier.select_frontier_goal()` is pure Python, no `numpy`, no `rclpy`, so it unit-tests against synthetic grids and the orchestrator calls it directly. It reads the `nav_msgs/OccupancyGrid` body of the live SLAM `/map` and returns the map-frame `(x, y)` of the best frontier, which the orchestrator turns into an ordinary `NavigateToPose` goal (Nav2's planner already allows unknown space).
+`frontier.select_frontier_goal()` is pure Python, no `numpy`, no `rclpy`, so it unit-tests against synthetic grids and the orchestrator calls it directly. It reads the `nav_msgs/OccupancyGrid` body of the live SLAM `/map` and returns the map-frame `(x, y)` of the best frontier, which the orchestrator turns into an ordinary `NavigateToPose` goal, Nav2's planner already allows unknown space (`allow_unknown: true`, `track_unknown_space: true`), so this is the only missing piece.
 
-The algorithm:
+<Mermaid chart={`
+flowchart LR
+  GRID["OccupancyGrid<br/>live SLAM /map"] --> P1["Pass 1<br/>frontier mask"]
+  P1 --> P2["Pass 2<br/>clearance drop"]
+  P2 --> P3["Pass 3<br/>8-connected clusters"]
+  P3 --> P4["Pass 4<br/>score and pick"]
+  P4 --> GOAL["map-frame (x, y)<br/>NavigateToPose"]
+`} />
+
+The four passes:
 
 1. **Frontier mask**, a cell is a frontier if it is free (`0 <= v <= frontier_free_thresh`, default `20`) and 4-adjacent to at least one `UNKNOWN` (`-1`) cell.
-2. **Clearance**, drop any frontier cell within `frontier_robot_radius_cells` (default `4`) of an occupied cell (`v >= frontier_occupied_thresh`, default `65`), so the robot fits.
-3. **Cluster**, 8-connected flood-fill of the surviving cells; clusters smaller than `frontier_min_cluster_cells` (default `6`) are discarded as SLAM noise.
-4. **Score & pick**, each cluster scores `size / (1 + distance_to_robot_m)` (size only when no robot pose is available). The winning cluster returns the real member cell nearest its centroid, guaranteed free and unknown-adjacent, never an averaged hole.
+2. **Clearance**, drop any frontier cell within the robot clearance of a solid cell, so the robot fits. The clearance is `frontier_robot_clearance_m` (default `0.35` m), converted to cells via `ceil(m / resolution)` so it tracks Nav2's `inflation_radius` at any map resolution. The `frontier_robot_radius_cells` param (default `-1`) is a raw-cell-count override, used mostly in tests, `-1` means use the metric clearance. A separate `frontier_clearance_occupied_thresh` can lower the occupancy treated as solid *for this pass only*, so soft inflated cells also push frontiers away.
+3. **Cluster**, 8-connected flood-fill of the surviving cells, clusters smaller than `frontier_min_cluster_cells` (default `6`) are discarded as SLAM noise.
+4. **Score and pick**, each cluster scores `size / (1 + distance_to_robot_m)` (size only when no robot pose is available). The winning cluster returns the real member cell nearest its centroid, guaranteed free and unknown-adjacent, **never** an averaged hole.
 
-The robot's live pose for that distance term comes from the `map → base_link` TF lookup (`_robot_xy`), *not* AMCL, in SLAM mode `/amcl_pose` is a static seed.
+The robot's live pose for that distance term comes from the `map -> base_link` TF lookup (`_robot_xy`), *not* AMCL, in SLAM mode `/amcl_pose` is a static seed and `slam_toolbox`'s `map -> odom` carries the real motion.
+
+<Figure src="/diagrams/rviz-frontier-goals.png" caption="RViz capture of the live SLAM /map with a selected frontier goal marker, showing the explored-free to unknown boundary the frontier mask detects." />
 
 ## Per-tag approach poses
 
@@ -126,13 +169,15 @@ The robot's live pose for that distance term comes from the `map → base_link` 
 3. The goal pose is `tag + standoff * normal`, with yaw pointing back at the tag so the front-facing camera frames the AprilTag head-on.
 4. If geometry can't run (no tables loaded, or tag at the table centre), fall back to the global `approach_yaw` parameter and `derived_from='fallback'`.
 
-Standoff is clamped to **`[0.2, 1.5]` m** (`MIN_STANDOFF_M` / `MAX_STANDOFF_M` in `approach.py`): 0.2 m keeps a 100 mm tag at a usable size on the Orbbec, beyond 1.5 m detection gets unreliable. Every nav goal logs `derived_from=geometry|override|fallback` plus the picked `table` and `standoff`, so operators can read the chosen path off stdout.
+Standoff is clamped to **`[0.2, 1.5]` m** (`MIN_STANDOFF_M` / `MAX_STANDOFF_M` in `approach.py`), 0.2 m keeps a 100 mm tag at a usable size on the Orbbec, beyond 1.5 m detection gets unreliable. Every nav goal logs `derived_from=geometry|override|fallback` plus the picked `table` and `standoff`, so operators can read the chosen path off stdout.
 
-`MONITORING` tags have no a-priori table, so `compute_discovered_approach()` derives the standoff from the discovered tag's own facing normal (its local +Z axis projected onto the map XY plane), falling back to the robot→tag vector when that normal degenerates.
+There is a quiet safety mechanism in the geometry path worth calling out. The centre-to-tag normal can *overshoot* across an aisle and land the goal inside the **next** table's bbox, a lethal or occupied cell. The **footprint guard** detects that, pulls the standoff back along the same outward normal in 0.1 m steps until the goal clears every table bbox, and only if nothing along the normal is clear does it fall back loudly so the operator adds an override. It is what stops the robot from driving a goal into the next aisle's bed.
+
+`MONITORING` tags have no a-priori table, so `compute_discovered_approach()` derives the standoff from the discovered tag's *own* facing normal. It takes the AprilTag's local **+Z axis** (the third column of the rotation matrix for the tag's map-frame quaternion, the ArUco convention where +Z points out of the marker into the aisle), projects it onto the map XY plane, parks `standoff` metres along it, and points yaw back at the tag. When that projection degenerates (a tag facing up/down, or noisy orientation) it falls back to approaching along the robot-to-tag vector, a side it can already reach, and finally to `fallback_yaw` if no robot pose is available.
 
 ### Per-tag overrides
 
-When the heuristic doesn't match reality, leaf occlusion, a shelf-mounted tag, window glare, drop a partial or full override into the `approach_overrides_file` YAML. It is loaded once at startup without rebuilding code; a misconfigured file logs an error and continues with no overrides rather than blocking start-up.
+When the heuristic doesn't match reality, leaf occlusion, a shelf-mounted tag, window glare, drop a partial or full override into the `approach_overrides_file` YAML. It is loaded once at startup without rebuilding code, a misconfigured file logs an error and continues with no overrides rather than blocking start-up.
 
 ```yaml
 overrides:
@@ -145,50 +190,152 @@ overrides:
     standoff: 0.4
 ```
 
-Any subset of `goal_x` / `goal_y` / `yaw` / `standoff` is allowed; missing fields fall through to the geometry result. A full override (all of `goal_x`, `goal_y`, `yaw`) short-circuits the geometry path.
+Any subset of `goal_x` / `goal_y` / `yaw` / `standoff` is allowed, missing fields fall through to the geometry result. A full override (all of `goal_x`, `goal_y`, `yaw`) short-circuits the geometry path.
 
 ## Localization gates
 
-There are **two tiers**, chosen by mission type in `_nav_localization_ok()`.
+There are **two tiers**, chosen by mission type in the per-leg gate.
 
-- **InspectionMission, tight covariance gate.** Before *every* `NavigateToPose`, the orchestrator re-checks `max(cov[0], cov[7], cov[35])` (the x / y / yaw diagonal of the latest `/amcl_pose`) against `nav_localization_cov_threshold` (default `0.25`). The start-of-mission gate in `PREPARE.LOCALIZING` catches "we never localized"; this per-leg gate catches drift accumulated over a long patrol (a kidnap, a low-feature aisle). On failure no goal is sent, the tag is marked `UNREACHABLE` with `status_detail=amcl_drift_var=<value>` and the mission advances.
-- **EXPLORING / MONITORING, presence-only gate.** These run in SLAM mode where `/amcl_pose` is a static seed, so the tight gate would wrongly fail every leg. They only require that *some* pose has arrived and trust `slam_toolbox`'s `map → odom`.
+- **InspectionMission, tight covariance gate.** Before *every* `NavigateToPose`, the orchestrator re-checks `max(cov[0], cov[7], cov[35])` (the x / y / yaw diagonal of the latest `/amcl_pose`) against `nav_localization_cov_threshold` (default `0.25`). The start-of-mission gate in `PREPARE.LOCALIZING` catches "we never localized", this per-leg gate catches drift accumulated over a long patrol (a kidnap, a low-feature aisle). On failure no goal is sent, the tag is marked `UNREACHABLE` with `status_detail=amcl_drift_var=<value>` and the mission advances.
+- **EXPLORING / MONITORING, presence-only gate.** These run in SLAM mode where `/amcl_pose` is a static seed, so the tight gate would wrongly fail every leg. They only require that *some* pose has arrived and trust `slam_toolbox`'s `map -> odom`.
 
 <Callout type="info">
-  The three QoS-latched subscriptions, `/amcl_pose`, `/map`, `/perception/discovered_tags`, are `RELIABLE + TRANSIENT_LOCAL` depth 1 to match their latched publishers. Mismatch the durability and the topic stays silently empty. (`/e_stop_state` is a separate `RELIABLE + VOLATILE` subscription.)
+  The three QoS-latched subscriptions, `/amcl_pose`, `/map`, `/perception/discovered_tags`, are `RELIABLE + TRANSIENT_LOCAL` depth 1 to match their latched publishers. Mismatch the durability and the topic stays silently empty.
 </Callout>
 
-## Pause and E-stop are flags, not states
+## Pause, E-stop, and battery are flags, not states
 
-Pause and E-stop never change the lifecycle state. They set flags that freeze the active sub-state in place and cancel the in-flight Nav2 goal. `_is_blocked()` (`self._paused or self._estop_engaged`) is checked by every on-enter handler and watchdog branch.
+Pause, E-stop, and battery-low never change the lifecycle state. They set flags that freeze the active sub-state in place and cancel the in-flight Nav2 goal. `_is_blocked()` (`self._paused or self._estop_engaged or self._battery_low`) is checked by every on-enter handler and watchdog branch.
+
+The design choice is deliberate. Modelling pause-while-navigating, paused-while-scanning, estopped-while-returning, and battery-low-while-monitoring as *states* would multiply the lifecycle graph combinatorially and lose the resume-in-place semantics. Keeping them as flags plus a per-handler `_is_blocked()` check keeps the lifecycle graph small, and a resume re-kicks *exactly* the held action via `_kick_current_state` instead of re-deriving where the mission was.
 
 - **`/e_stop_state` rising edge** cancels the in-flight goal and sets *both* `estop_engaged` and `paused`. The falling edge clears only `estop_engaged`, release deliberately does **not** auto-resume.
-- **`/mission/resume`** is the only thing that unblocks. It clears `paused` and re-kicks the active state's action (`_kick_current_state`), and is rejected while the E-stop is still engaged.
-- **Operator cancels refund the retry counter.** A pause / E-stop / abort / skip that cancels a goal mid-flight decrements the per-tag `nav_attempts` counter (`_cancel_inflight_nav(..., refund_attempt=True)`), that attempt never got a chance to fail naturally, so it shouldn't burn a retry. Nav2-internal failures (`ABORTED`, rejected, timeout) keep the attempt counted.
+- **`/mission/resume`** is the only thing that unblocks. It clears `paused` and re-kicks the active state's action, and is rejected while the E-stop is still engaged *or* the battery is still low.
+- **Operator cancels refund the retry counter.** A pause / E-stop / abort / skip that cancels a goal mid-flight decrements the per-tag `nav_attempts` counter (`_cancel_inflight_nav(..., refund_attempt=True)`), that attempt never got a chance to fail naturally, so it shouldn't burn a retry. Nav2-internal failures (`ABORTED`, rejected, timeout) keep the attempt counted. The same cancel machinery flags `_nav_pending_cancel`, so a goal-accept callback that lands *after* the cancel cancels the goal server-side rather than driving the mission forward on a stale future.
+
+<Callout type="warn">
+  **Autonomous E-stop depends on a bridge that was missing in production until 2026-06-04.** The orchestrator's `EStopMonitor` subscribes `/e_stop_state` (`std_msgs/Bool`), but for a long time *nothing published it*, the physical button is `/io/intensity/emergency_button/digital` (`mirte_msgs/IntensityDigital`, **not** `Bool`) and the HMI STOP was a client-side `cmd_vel` gate. `lupin_hmi/estop_bridge` now ORs both onto `/e_stop_state` at 5 Hz. The button polarity (`engaged_value`) is **still unverified on hardware**, press the real button and confirm `/e_stop_state` goes true before trusting it. See [war stories](/docs/war-stories).
+</Callout>
+
+## The battery subsystem
+
+The robot must never strand itself far from the dock with a flat pack, *and* a low-battery return must never silently throw away the run. The orchestrator solves both with a cross-cutting `BatteryMonitor` (`battery_monitor.py`) plus a dedicated `RETURNING` decision policy.
+
+`BatteryMonitor` subscribes `/io/power/power_watcher` (`sensor_msgs/BatteryState`) and normalizes the reading through `normalize_battery_percentage()` into a `0..1` fraction. That normalization is load-bearing, the spec is `0..1` but some MIRTE power watchers publish `0..100` and others emit `NaN` when only voltage is known, so a raw `< 0.20` compare would *never fire* on a `0..100` or `NaN` publisher and silently disable the whole safety net. NaN/inf/negative readings are rejected (keep the last known state), `> 1.0` values are rescaled.
+
+Below `battery_low_threshold` (default `0.20`) it fires `on_battery_low` (`node.py:948`), which cancels the in-flight nav (with a refund), captures `_return_origin` for the family it is leaving, and diverts to `RETURNING`. While `battery_low` is set, `_is_blocked()` stays true so no new goals issue. `on_battery_recovered` clears the flag but leaves `paused` set, the operator must call `/mission/resume` after charging, exactly the same release policy as the E-stop.
+
+<Mermaid chart={`
+sequenceDiagram
+  participant Bat as BatteryMonitor
+  participant Orch as Orchestrator
+  participant Nav as Nav2
+  participant Op as Operator
+  Bat->>Orch: on_battery_low (below 0.20)
+  Orch->>Nav: cancel in-flight goal (refund)
+  Orch->>Orch: capture _return_origin
+  Orch->>Orch: abort_to_return -> RETURNING
+  Orch->>Nav: dock goal
+  Nav-->>Orch: SUCCEEDED
+  Orch->>Orch: pause (battery still low)
+  Op->>Bat: charge robot
+  Bat->>Orch: on_battery_recovered (flag clears, stays paused)
+  Op->>Orch: /mission/resume
+  Orch->>Orch: resume_origin re-enters the held family
+`} />
+
+### The RETURNING dock decision tree
+
+`RETURNING` is the richest state in the file because the *same* state serves four very different intents, a battery divert, a manual dock, a normal completion, and an abort, and each wants a different outcome on the dock goal's result. The branch logic lives in `_on_return_nav_result` (`node.py:2537`) and the pure, ROS-free `decide_failed_dock` (`return_policy.py`).
+
+<Mermaid chart={`
+flowchart TD
+  RES["dock goal result"] --> OK{"SUCCEEDED?"}
+  OK -->|yes| BAT{"battery dock and<br/>resumable and<br/>mission incomplete?"}
+  BAT -->|yes| PAUSE1["PAUSE<br/>await charge + resume"]
+  BAT -->|no| MAN{"manual dock and<br/>resumable?"}
+  MAN -->|yes| PAUSE2["PAUSE<br/>await resume"]
+  MAN -->|no| DONE1["DONE"]
+  OK -->|no| CAN{"CANCELED and<br/>not battery_low?"}
+  CAN -->|yes| RESEND["re-send dock goal once"]
+  CAN -->|no| POL["decide_failed_dock"]
+  POL --> RETRY["retry below max"]
+  POL --> PAUSE3["pause in place"]
+  POL --> DONE2["DONE"]
+`} />
+
+The asymmetry that prose can't show cleanly: a **battery-triggered** dock that fails is retried up to `dock_retry_max` (default `3`), then pauses *in place* still-resumable, because its whole purpose is to preserve the run. Every **other** failed dock (normal completion, operator abort) treats a failed dock as non-fatal and ends the mission (`DONE`) rather than stranding the robot in `RETURNING`. That single invariant, *a battery return must never silently end the mission*, is why `decide_failed_dock` exists as its own tested module.
+
+There are two more hardening paths around this:
+
+- **Deferred-dock cancel watchdog.** `on_enter_RETURNING` defers the dock goal behind any pending nav cancel (it just diverted from an in-flight goal) and arms a one-shot `_RETURN_CANCEL_GRACE_S` (`3.0` s) timer. If the cancel ack is lost over DDS or the action server churns on a rapid abort, the watchdog (`_on_return_cancel_watchdog`) forces the dock goal anyway, a fresh `NavigateToPose` preempts any lingering goal server-side, so a lost ack can't strand the robot in `RETURNING`.
+- **Dock timeout.** `_check_dock_timeout` bounds an accepted-but-stalled dock drive at `dock_timeout_s` (default `60.0`) and routes a stuck dock through the *same* `decide_failed_dock` policy, so a wedged dock degrades like a failed one instead of draining the battery in place.
+
+<Callout type="info">
+  Battery-dock-resume is the thorniest corner of the orchestrator and the page is honest about it, an earlier bug treated a non-SUCCEEDED battery dock (an `ABORTED` surfaces as `nav_status_6`) as "non-fatal -> DONE" and discarded the run, and a later edge case could re-run the mission on a still-low battery. `decide_failed_dock` and the `/mission/resume` battery gate are the result.
+</Callout>
+
+### Resume re-enters the family it left
+
+When a battery or manual dock interrupts a run, `/mission/resume` must put the robot back where it was. `_resume_origin_for` (`node.py:287`) captures whether the divert left `INSPECTING`, `MONITORING`, or `EXPLORING`, and `_handle_resume` fires the matching `resume_inspection` / `resume_monitoring` / `resume_exploration` trigger back into that sub-machine. Without this, *every* resume fell into `INSPECTING`, which would end a `MONITORING` loop early, `INSPECTING_PUBLISHING` exits to `RETURNING` when the tag list ends, whereas `MONITORING` keeps sweeping until its `monitoring_sweeps` complete. The resume edges from `RETURNING` to each family are what make a mid-monitor charge transparent.
+
+## Concurrency: why a stale trigger must no-op
+
+The orchestrator runs on a `SingleThreadedExecutor` with a `MutuallyExclusiveCallbackGroup`, so HSM transitions are *serialised*, two triggers never fire concurrently. The machine is built with `queued=True` and `ignore_invalid_triggers=True`, and the combination is the single most subtle thing in the node.
+
+Under `queued=True`, a trigger fired from *inside* a transition callback is **not** run re-entrantly, it is appended to a queue and drained after the current transition finishes. So a trigger that was valid when enqueued (a `scan_done` from `SCANNING`) can drain *after* an earlier-queued `abort_to_return` or battery divert has already moved the machine to `RETURNING`. The invariant the node relies on: the divert trigger must be enqueued *before* the loop trigger, so the loop trigger drains against the post-divert state and is the one that no-ops.
+
+With `ignore_invalid_triggers=False`, that stale drain raised `MachineError` in the spin loop and **wedged** the mission, stuck in `RETURNING`, never docking. The fast monitoring loop made this real, not theoretical. Setting `ignore_invalid_triggers=True` turns the stale drain into a graceful no-op, and the per-callback entry guards (each handler re-checks `self.state` and `_is_blocked()`) remain as defence-in-depth.
 
 ## Operator services
 
-All four control services are `std_srvs/srv/Trigger`; `start` is the custom `StartMission`.
+Six control services drive the node. `start` is the custom `StartMission`, the rest are `std_srvs/srv/Trigger`.
 
 | Service | Type | Effect |
 |---|---|---|
 | `/mission/start` | `lupin_msgs/srv/StartMission` | Begin a mission. Rejected in `FAULT`, while a mission runs, on unknown `mission_type`, non-positive `discovery_goal`, or unknown tag ids. Returns `accepted`, `mission_id` (`<mission_id_prefix>-<uuid8>`), `error_message`. |
 | `/mission/pause` | `std_srvs/srv/Trigger` | Cancel the in-flight goal, set the `paused` flag. Rejected if no active mission or already paused. |
-| `/mission/resume` | `std_srvs/srv/Trigger` | Clear `paused`, re-kick the active action. Rejected if not paused or while E-stop is engaged. |
-| `/mission/abort` | `std_srvs/srv/Trigger` | Cancel the goal and route to `RETURNING`. For `InspectionMission`, marks every remaining tag `SKIPPED` (one observation each). An abort from `PREPARE` is treated as a soft `FAULT`. |
+| `/mission/resume` | `std_srvs/srv/Trigger` | Clear `paused`, re-kick the active action (or resume the held family if docked). Rejected if not paused, while E-stop is engaged, or while battery is low. |
+| `/mission/abort` | `std_srvs/srv/Trigger` | Cancel the goal and route to `RETURNING`. For `InspectionMission`, marks every remaining tag `SKIPPED` (one observation each). An abort from `PREPARE` routes to `RETURNING -> dock -> DONE`, **not** a dead-end `FAULT`. |
 | `/mission/skip_current` | `std_srvs/srv/Trigger` | Mark the current tag `SKIPPED` (`status_detail=skipped_by_operator`), emit its observation, advance. Valid only during `INSPECTING`. |
+| `/mission/dock` | `std_srvs/srv/Trigger` | Operator-commanded dock from an active autonomous family. Captures the resume origin, cancels the goal, routes to `RETURNING`, and on arrival pauses still-resumable. Rejected in `READY`/`BOOT`/`DONE`/`FAULT`/`PREPARE` and while already `RETURNING`. |
+| `/mission/reset` | `std_srvs/srv/Trigger` | Clear a `FAULT` (`recover` -> `READY`) without restarting the process, since every `FAULT` source (boot-dep timeout, localization timeout, prepare-abort) is transient. Rejected outside `FAULT`. |
 
 ## Status and observations
 
-Two publishers carry mission state outward:
+Two publishers carry mission state outward.
 
-- **`/mission/state`**, `lupin_msgs/MissionState`, published at `state_publish_rate_hz` (default `5.0`) whenever the node is alive, QoS `RELIABLE + TRANSIENT_LOCAL` depth 1 (latched, so late subscribers see the current snapshot). Carries `lifecycle_state`, `mission_phase`, `current_target`, the `targets_*` counters, `tags_discovered` / `discovery_goal` during exploration, `last_error`, `estop_engaged`, `paused`, and `started_at`. The `mission_phase` field surfaces `CONFIRMING` while `/perception/confirm_tag` is in flight, distinct from the umbrella `SCANNING` state.
-- **`/floranova/observations`**, `lupin_msgs/Observation`, one event per closed tag (`OK` / `UNREACHABLE` / `SCAN_FAILED` / `SKIPPED`), QoS `RELIABLE + TRANSIENT_LOCAL` depth 50, so a late subscriber sees the mission so far. `tag_pose_in_map` is populated from the latest AMCL snapshot **only** on `STATUS_OK`; on any non-OK result it stays zero (`orientation.w == 0`), the "missing" sentinel the digital twin expects.
+<Figure src="/screenshots/hmi-mission-state-strip.png" caption="Web HMI mission strip showing lifecycle_state, mission_phase (SCANNING/CONFIRMING), the targets counters, battery_percentage, and the EXPLORE k/N to MONITOR handoff." />
+
+`/mission/state` carries `lupin_msgs/MissionState`, published at `state_publish_rate_hz` (default `5.0`) whenever the node is alive, QoS `RELIABLE + TRANSIENT_LOCAL` depth 1 (latched, so late subscribers see the current snapshot).
+
+<TypeTable
+  type={{
+    lifecycle_state: { type: 'string', description: 'BOOT | READY | PREPARE | EXPLORING | INSPECTING | MONITORING | RETURNING | DONE | FAULT.' },
+    mission_phase: { type: 'string', description: 'Sub-state: NAVIGATING | SCANNING | CONFIRMING | PUBLISHING | LOCALIZING. CONFIRMING is surfaced while /perception/confirm_tag is in flight, distinct from the umbrella SCANNING.' },
+    current_target: { type: 'string', description: 'The tag id being processed, empty otherwise.' },
+    targets_total: { type: 'uint16', description: 'Total / completed / failed / unreachable / skipped counters (one field each).' },
+    tags_discovered: { type: 'uint16', description: 'Distinct tags found vs discovery_goal during EXPLORING; both 0 for InspectionMission.' },
+    last_error: { type: 'string', description: 'Raw last-event code, e.g. battery_low, nav_status_6.' },
+    last_event: { type: 'string', description: 'Human-facing label from classify_event, empty when no event.' },
+    last_event_severity: { type: 'uint8', description: 'SEVERITY_INFO(0) | WARN(1) | ERROR(2), so the HMI shows the right tone.' },
+    estop_engaged: { type: 'bool', description: 'True while the E-stop is latched.' },
+    paused: { type: 'bool', description: 'True while held by pause / E-stop / battery.' },
+    battery_percentage: { type: 'float32', description: '0..1 fraction from BatteryMonitor.' },
+    battery_low: { type: 'bool', description: 'True while battery is below threshold and a dock-or-pause is in force.' },
+  }}
+/>
+
+The `last_event` / `last_event_severity` pair (and `classify_event` in `events.py`) exist for a concrete reason. The HMI used to tag *every* `last_error` change red, so a routine `battery_low` notice showed up as a red "orchestrator error". `classify_event` maps each code to a severity and a friendly label (`battery_low` -> info-toned "battery low", `nav_status_*` -> warn "navigation retry", only real `localization_failed` / `dependency_timeout` are `SEVERITY_ERROR`) so routine notices read as info or warn, not error.
+
+`/floranova/observations` carries `lupin_msgs/Observation`, one event per closed tag (`OK` / `UNREACHABLE` / `SCAN_FAILED` / `SKIPPED`), QoS `RELIABLE + TRANSIENT_LOCAL` depth 50, so a late subscriber sees the mission so far. On an `OK` result, `tag_pose_in_map` is set from the discovered tag's **own** map pose (the `/perception/discovered_tags` feed, resolved by `perception_aggregator` via TF), so the twin pins the tag where it physically is, falling back to the latest AMCL pose (the robot's standoff pose) *only* when the tag's own pose is unknown. On any non-OK result it stays zero (`orientation.w == 0`), the "missing" sentinel the digital twin expects.
 
 ```bash
 ros2 topic echo /mission/state                # 5 Hz status snapshot
 ros2 topic echo /floranova/observations       # one per tag completion
 ```
+
+See [interfaces](/docs/interfaces) for the full `MissionState`, `Observation`, and `StartMission` field listings.
 
 ## Failure policy
 
@@ -199,14 +346,15 @@ ros2 topic echo /floranova/observations       # one per tag completion
 | Visual confirm `detected=false` / `visual_confirmation_timeout_s` | Mark `SCAN_FAILED`, advance. | `SCAN_FAILED`, detail = perception's `error_message` or `confirm_timeout`. |
 | Bridge unknown tag / exception / `scan_timeout_s` | Mark `SCAN_FAILED`, advance. | `SCAN_FAILED`, detail = bridge error or `scan_timeout`. |
 | `/mission/skip_current` | Cancel goal, advance. | `SKIPPED`, `status_detail=skipped_by_operator`. |
-| `/mission/abort` | Cancel goal, mark remaining `SKIPPED`, `→ RETURNING`. | One `SKIPPED` per remaining tag. |
-| E-stop mid-mission | Cancel goal, freeze. | None, observations resume after `/mission/resume`. |
-| Nav2 fail in `RETURNING` | Log, `→ DONE` anyway. | None. |
-| `dependency_timeout_s` / `localization_timeout_s` lapse | `→ FAULT`. | None. |
+| `/mission/abort` | Cancel goal, mark remaining `SKIPPED`, `-> RETURNING`. | One `SKIPPED` per remaining tag. |
+| E-stop or battery-low mid-mission | Cancel goal, freeze (battery also diverts to dock). | None, observations resume after `/mission/resume`. |
+| Dock fail/`dock_timeout_s`, **battery** return | Retry up to `dock_retry_max`, then pause in place (resumable). | None. |
+| Dock fail/`dock_timeout_s`, **non-battery** return | Log, `-> DONE` anyway. | None. |
+| `dependency_timeout_s` / `localization_timeout_s` lapse | `-> FAULT` (clearable via `/mission/reset`). | None. |
 
 ## Bring-up
 
-The launch file starts only the orchestrator; Nav2 and the bridge must already be running.
+The launch file starts only the orchestrator, Nav2 and the bridge must already be running.
 
 ```bash
 # Runtime deps that aren't in rosdep
@@ -219,9 +367,11 @@ ros2 launch lupin_mission mission.launch.py
   `tag_sequence` and `dock_pose` are array-typed and are **not** wired through launch arguments. Set them with `--ros-args -p` or a YAML param file.
 </Callout>
 
+## See also
+
 <Cards>
   <Card title="Navigation" href="/docs/navigation">Nav2, MPPI, and the SLAM/AMCL modes the gates depend on.</Card>
   <Card title="Perception" href="/docs/perception">The aggregator behind `/perception/discovered_tags` and `/perception/confirm_tag`.</Card>
   <Card title="Interfaces" href="/docs/interfaces">`MissionState`, `Observation`, and `StartMission` field by field.</Card>
-  <Card title="Web HMI & voice" href="/docs/web-hmi">The console that subscribes to `/mission/state` and calls these services.</Card>
+  <Card title="War stories" href="/docs/war-stories">The E-stop-wired-to-nothing and battery-return-ended-DONE fixes behind this design.</Card>
 </Cards>

@@ -1,45 +1,68 @@
 ---
 title: Architecture
-description: How Lupin's nine ROS 2 packages fit together, the Explore → Navigate → Perceive → Twin → HMI pipeline, the command bus, and the sim ↔ hardware boundary.
+description: How Lupin's nine ROS 2 packages fit together, the lupin_msgs interface root, the Explore Navigate Perceive Twin HMI pipeline, the twist_mux command bus with priorities, the mission orchestrator FSM, the e-stop and battery safety lane, the per-tag approach-pose geometry, the latched-snapshot QoS contract, and the sim vs hardware drive-topic boundary.
 ---
 
-Lupin is one ROS 2 Humble workspace split into **nine packages**. Each owns a single
-concern, and they connect through a small set of typed topics and services rather than
-shared state. The *same logic runs in Gazebo and on the real MIRTE Master V2*, only the
-bring-up files and a single drive topic differ. This page is the map: who owns what, how
-data flows from an empty map to a live world model, and where the sim/hardware line is
-drawn.
+Lupin is one ROS 2 Humble workspace split into **nine packages**, each owns a single concern, and they connect through a small set of typed topics and services rather than shared state. The *same logic runs in Gazebo and on the real MIRTE Master V2*, only the bring-up files and a single drive topic differ. This page is the map: who owns what, how data flows from an empty map to a live world model, how the FSM and the command bus arbitrate, and exactly where the sim/hardware line is drawn.
 
 ## The nine packages
 
+`lupin_msgs` sits at the root, everything else links against it, and `lupin_bringup` is the integrator that wires the rest together per scenario.
+
 | Package | Responsibility |
 | --- | --- |
-| `lupin_msgs` | The interface contract: 10 messages + 6 services (`ament_cmake` / `rosidl`). No nodes. Everything else links against it. |
-| `lupin_bringup` | Top-level launch per scenario (`sim_full.launch.py`, `hardware.launch.py`, `onboard.launch.py`, `cameras.launch.py`), the greenhouse-world generator, systemd units, and DDS-over-WiFi glue. |
-| `lupin_navigation` | Nav2 + `slam_toolbox` tuned for the mecanum base: MPPI controller, `motion_model: Omni`, AMCL-vs-SLAM modes, and the `/lupin/nav/clear_map` reset service. |
-| `lupin_mission` | The mission orchestrator: a hierarchical state machine driving `InspectionMission` and `ExplorationMission` over Nav2 + the greenhouse bridge. Publishes every tag scan as an `Observation`. |
-| `lupin_perception` | Vision: `tag_annotator` (OpenCV ArUco AprilTags), `yolo_detector` (Ultralytics tulip/bug classifier), and `perception_aggregator` fusing them into discovered tags + flower observations. |
+| `lupin_msgs` | The interface contract: **11 messages + 11 services** (`ament_cmake` / `rosidl`). **No** nodes. Everything else links against it. The extra services beyond the mission core are the arm surface: `ArmRecord`, `ArmLibraryEdit`, `GetArmLibrary`, `PlayArmSequence`, `SaveArmPose`, `SetArmPreset`, `CalibrateArm`. |
+| `lupin_bringup` | Top-level launch per scenario (`sim_full.launch.py`, `sim_robot.launch.py`, `hardware.launch.py`, `onboard.launch.py`, `greenhouse_sim.launch.py`), the greenhouse-world generator, systemd units, and DDS-over-WiFi glue. The *integrator*, it depends on navigation, bridge, mission, web, and perception. |
+| `lupin_navigation` | Nav2 + `slam_toolbox` tuned for the mecanum base: MPPI controller (`nav2_mppi_controller::MPPIController` on the `FollowPath` slot), `nav2_amcl::OmniMotionModel`, AMCL-vs-SLAM modes, and the `/lupin/nav/clear_map` reset service. |
+| `lupin_mission` | The mission orchestrator: a hierarchical state machine driving `InspectionMission`, `ExplorationMission`, and `MonitoringMission` over Nav2 + the greenhouse bridge, plus the e-stop and battery safety monitors. Publishes every tag scan as an `Observation`. |
+| `lupin_perception` | Vision: `tag_annotator` (OpenCV ArUco AprilTags), the flower detector (`yolo_detector` on hardware, `sim_flower_detector` HSV stand-in in Gazebo), and `perception_aggregator` fusing them into discovered tags + flower observations. |
 | `lupin_greenhouse_bridge` | A ROS wrapper around the course `mdp-greenhouse` simulator. One service, `~/get_tag_reading`, returns per-tag climate sensor readings. |
-| `lupin_twin` | The digital twin: aggregates `/floranova/observations` into a latched `/twin/state` snapshot and an inverse-distance-weighted `/twin/get_field` heatmap service. |
-| `lupin_hmi` | Teleop and the command bus: gamepad/keyboard driving, the `twist_mux` arbitration config, arm/gripper bridges, presets, calibration, and boot-time auto-home. |
-| `lupin_web` | The browser mission console on `:8090` (Vite + React), talking to ROS over `rosbridge` (`:9090`), plus a 16-tool Gemini Live voice agent. No ROS nodes, it is a pure rosbridge client. |
+| `lupin_twin` | The digital twin: aggregates `/floranova/observations` into a latched `/twin/state` snapshot and an inverse-distance-weighted `/twin/get_field` heatmap service. Zero Nav2/Gazebo dependency. |
+| `lupin_hmi` | Teleop and the command bus: gamepad/keyboard driving, the `twist_mux` arbitration config, arm/gripper bridges, presets, calibration, boot-time auto-home, and the `estop_bridge` that wires the physical button into the FSM. |
+| `lupin_web` | The browser mission console on `:8090` (Vite + React), talking to ROS over `rosbridge` (`:9090`), plus a Gemini Live voice agent. **No** ROS nodes, its `console_scripts` is empty, it is a pure rosbridge client that depends on `lupin_hmi` only for launch glue and `rosbridge_server`. |
 
-Each package has its own page: [Navigation](/docs/navigation),
-[Mission](/docs/mission), [Perception](/docs/perception),
-[Digital twin](/docs/digital-twin), [Greenhouse bridge](/docs/greenhouse-bridge),
-[Teleop](/docs/teleop), [Web HMI](/docs/web-hmi), and the
-[Interfaces](/docs/interfaces) reference for `lupin_msgs`.
+Each package has its own page: [Navigation](/docs/navigation), [Mission](/docs/mission), [Perception](/docs/perception), [Digital twin](/docs/digital-twin), [Greenhouse bridge](/docs/greenhouse-bridge), [Teleop](/docs/teleop), [Web HMI](/docs/web-hmi), and the [Interfaces](/docs/interfaces) reference for `lupin_msgs`.
+
+The build dependencies are not arbitrary, they encode the *layering*: the interface root at the bottom, the leaf concerns in the middle, the integrator at the top.
+
+<Mermaid chart={`
+graph TD
+  MSGS["lupin_msgs<br/>interface root"]
+  BRINGUP["lupin_bringup<br/>integrator"]
+  NAV["lupin_navigation"]
+  MIS["lupin_mission"]
+  PERC["lupin_perception"]
+  TWIN["lupin_twin"]
+  BRIDGE["lupin_greenhouse_bridge"]
+  HMI["lupin_hmi"]
+  WEB["lupin_web"]
+  NAV2["nav2 stack + slam_toolbox"]
+  VENDOR["twist_mux · joy · mirte_msgs"]
+
+  BRINGUP --> NAV
+  BRINGUP --> MIS
+  BRINGUP --> PERC
+  BRINGUP --> BRIDGE
+  BRINGUP --> WEB
+  WEB --> HMI
+  HMI --> VENDOR
+  HMI --> MSGS
+  NAV --> NAV2
+  PERC --> MSGS
+  MIS --> MSGS
+  TWIN --> MSGS
+  BRIDGE --> MSGS
+`} />
 
 ## The data-flow pipeline
 
-Lupin turns an unmapped greenhouse into a queryable world model in one chain. The arrows
-below are the actual topics and services that connect each stage:
+Lupin turns an unmapped greenhouse into a queryable world model in one chain. The arrows below are the actual topics and services that connect each stage:
 
 <Mermaid chart={`
 graph LR
-  EXPLORE["EXPLORE<br/>mission BFS"]
+  EXPLORE["EXPLORE<br/>frontier select"]
   NAV["NAVIGATE<br/>Nav2 · MPPI"]
-  PERC["PERCEIVE<br/>AprilTag + YOLO"]
+  PERC["PERCEIVE<br/>AprilTag + flower"]
   MISSION["MISSION SCAN<br/>orchestrator"]
   BRIDGE["greenhouse_bridge<br/>mdp-greenhouse sim"]
   TWIN["TWIN<br/>IDW field"]
@@ -56,137 +79,231 @@ graph LR
 
 In prose:
 
-1. **Explore.** `mission_orchestrator` runs a pure-Python BFS frontier planner over the
-   live `/map` (from `slam_toolbox`) and drives toward unexplored cells until it has
-   discovered *N* distinct AprilTags. `lupin_perception`'s `perception_aggregator`
-   publishes the running registry on `/perception/discovered_tags` (`DiscoveredTags`),
-   which the orchestrator counts toward `discovery_goal`.
-2. **Navigate.** For each tag, the orchestrator synthesises an approach pose from table
-   geometry and sends a `nav2_msgs/action/NavigateToPose` goal. Nav2's MPPI controller
-   plans the path; its output never touches `/cmd_vel` directly (see the command bus
-   below).
-3. **Perceive.** While parked and SCANNING, `tag_annotator` detects the AprilTag and
-   broadcasts a `tag_<id>` TF; the `yolo_detector` classifies tulip species and the
-   `bug` anomaly on the gripper camera. On hardware, the orchestrator first calls
-   `/perception/confirm_tag` (`ConfirmTag`) as a visual gate.
-4. **Read + publish.** The orchestrator calls `/greenhouse_bridge/get_tag_reading`
-   (`GetTagReading`) to fetch the tag's climate sensors, then publishes a typed
-   `lupin_msgs/Observation` on **`/floranova/observations`**, one per closed tag. The
-   aggregator independently publishes `KIND_FLOWER` observations on the same topic.
-5. **Twin.** `lupin_twin` is the sole consumer that aggregates `/floranova/observations`
-   into a per-tag world store, republishing the whole world on **`/twin/state`**
-   (`TwinState`) and serving on-demand sensor heatmaps via `/twin/get_field` (`GetField`,
-   inverse-distance-weighted).
-6. **HMI.** The web console (`lupin_web`) subscribes to `/twin/state`, `/mission/state`,
-   the camera streams, and the AprilTag overlay, and renders the world live, driveable
-   by joystick, map-click, or voice.
+1. **Explore.** `mission_orchestrator` runs a **frontier planner** (`frontier.select_frontier_goal`) over the live `/map` from `slam_toolbox` and drives toward the best boundary between explored-free and unknown space until it has discovered *N* distinct AprilTags. The planner is **not** a BFS-to-nearest: it (1) marks frontier cells that are free and 4-adjacent to UNKNOWN, (2) drops cells within `robot_clearance_m` (default 0.35 m) of an obstacle so the robot fits, (3) flood-fills the survivors into 8-connected clusters, (4) discards clusters smaller than `min_cluster_cells` (default 6) as SLAM noise, and (5) scores each surviving cluster `size / (1 + distance_to_robot_m)`. The deque in there is only the flood-fill queue, not a search. `perception_aggregator` publishes the running registry on `/perception/discovered_tags` (`DiscoveredTags`), which the orchestrator counts toward `discovery_goal`.
+2. **Navigate.** For each tag, the orchestrator synthesises an **approach pose** (not just an `(x, y)`, the *yaw* matters so the camera frames the tag head-on) and sends a `nav2_msgs/action/NavigateToPose` goal. Nav2's MPPI controller plans the path; its output never touches `/cmd_vel` directly (see the command bus below).
+3. **Perceive.** While parked and SCANNING, `tag_annotator` detects the AprilTag and broadcasts a `tag_<id>` TF; the flower detector classifies tulip species and the `bug` anomaly on the gripper camera. On hardware, the orchestrator first calls `/perception/confirm_tag` (`ConfirmTag`) as a visual gate.
+4. **Read + publish.** The orchestrator calls `/greenhouse_bridge/get_tag_reading` (`GetTagReading`) to fetch the tag's climate sensors, then publishes a typed `lupin_msgs/Observation` on **`/floranova/observations`**, one per closed tag. The aggregator independently publishes `KIND_FLOWER` observations on the same topic.
+5. **Twin.** `lupin_twin` is the sole consumer that aggregates `/floranova/observations` into a per-tag world store, republishing the whole world on **`/twin/state`** (`TwinState`) and serving on-demand sensor heatmaps via `/twin/get_field` (`GetField`, inverse-distance-weighted).
+6. **HMI.** The web console (`lupin_web`) subscribes to `/twin/state`, `/mission/state`, the camera streams, and the AprilTag overlay, and renders the world live, driveable by joystick, map-click, or voice.
 
 <Callout type="info">
-  `/floranova/observations` is the seam of the whole system. The mission orchestrator and
-  the perception aggregator are the only publishers; the digital twin and the web HMI are
-  the only consumers. Swapping the data source (sim oracle vs. real perception) leaves
-  every downstream contract untouched.
+  `/floranova/observations` is the seam of the whole system. It has **two** publishers (the orchestrator emits `KIND_TAG_READING` after the bridge call, the aggregator emits `KIND_FLOWER` independently) and **one-and-a-half** consumers (the twin ingests `TAG_READING` + `FLOWER` and drops unmodelled kinds loudly, the web HMI is a render-only late joiner). Swapping the data source, sim oracle versus real perception, leaves every downstream contract untouched.
 </Callout>
+
+### The live node + topic graph
+
+The curated graph below is the *current* `twist_mux` era. The in-repo dumps under `docs/architecture/nodes_nav2_sim.txt` and `topics_nav2_sim.txt` are stale ground truth from 2026-04-30, captured during the retired `cmd_vel_mux.py` era, so they show `/cmd_vel_mux` and `/cmd_vel_teleop` instead of today's `/twist_mux` and `/cmd_vel_joy`. Anyone citing them verbatim documents a graph that no longer exists.
+
+<Mermaid chart={`
+graph TD
+  subgraph drive["DRIVE BUS"]
+    JOY["joy_node + teleop_twist_joy"]
+    NAV2["controller_server"]
+    SMOOTH["velocity_smoother"]
+    MUX["twist_mux"]
+    JOY -->|/cmd_vel_joy| MUX
+    WEB2["lupin_web"] -->|/cmd_vel_manual| MUX
+    NAV2 -->|/cmd_vel_nav| SMOOTH
+    SMOOTH -->|/cmd_vel_auto| MUX
+    ZERO["sim zero guard"] -->|/zero_cmd_vel| MUX
+    MUX -->|cmd_vel_out| BASE["base controller"]
+  end
+  subgraph perc["PERCEPTION TWIN"]
+    TAG["tag_annotator"] -->|tag detections| AGG["perception_aggregator"]
+    FLOW["flower detector"] -->|/yolo/detections| AGG
+    AGG -->|/perception/discovered_tags| ORCH["mission_orchestrator"]
+    AGG -->|/floranova/observations| TW["lupin_twin"]
+    ORCH -->|/floranova/observations| TW
+    ORCH -->|/mission/state| WEB2
+    TW -->|/twin/state| WEB2
+  end
+  subgraph safe["SAFETY LANE"]
+    EB["estop_bridge"] -->|/e_stop_state| ORCH
+    BAT["battery_monitor"] -->|low edge| ORCH
+  end
+`} />
+
+<Accordions type="single">
+  <Accordion title="Raw rqt graph (regenerate before trusting)">
+    The `rqt_graph` capture below is the raw ground truth behind the curated Mermaid graph. Regenerate it from a live `sim_full` run, the committed dump predates the `twist_mux` migration and shows the retired `cmd_vel_mux` nodes.
+
+    <Figure src="/diagrams/rqt_graph_nav2_sim_annotated.png" caption="Full rqt node graph captured under sim_full with Nav2 active, annotated to highlight the twist_mux arbitration cluster and the perception to twin seam. Regenerate from a current run, the in-repo dump is from the retired cmd_vel_mux era." />
+  </Accordion>
+</Accordions>
 
 ## The command-arbitration bus
 
-Autonomy, gamepad teleop, and the web HMI all want to drive the same base. Rather than
-let them fight, every velocity source feeds a single `twist_mux` (configured in
-`lupin_hmi/config/twist_mux.yaml`) that arbitrates by priority, higher wins, with a
-per-source silence timeout:
+Autonomy, gamepad teleop, and the web HMI all want to drive the same base. Rather than let them fight, every velocity source feeds a single `twist_mux` (configured in `lupin_hmi/config/twist_mux.yaml`) that arbitrates by priority, higher wins, with a per-source silence timeout:
 
 | Input topic | Source | Priority | Timeout |
 | --- | --- | --- | --- |
 | `/cmd_vel_joy` | Xbox dead-man teleop (`teleop_twist_joy`) | 100 | 0.3 s |
 | `/cmd_vel_manual` | Web HMI joystick / DS4 teleop | 50 | 0.5 s |
 | `/cmd_vel_auto` | Nav2 (`velocity_smoother`) | 10 | 0.5 s |
+| `/zero_cmd_vel` | Sim-only idle-stop guard | 1 | 1.0 s |
 
-The key design choice: **Nav2 never publishes to the controller directly.** Its
-`controller_server` emits on `/cmd_vel_nav`, the `velocity_smoother` smooths it and
-remaps the output to `/cmd_vel_auto`, the *lowest* priority input. So holding the Xbox
-dead-man instantly preempts autonomy, and the web joystick overrides it too, all through
-the same chain. The `twist_mux` output is remapped to the base controller's drive topic
-(`cmd_vel_out`).
+<Mermaid chart={`
+graph LR
+  CS["controller_server"] -->|/cmd_vel_nav| VS["velocity_smoother"]
+  VS -->|"/cmd_vel_auto (10)"| MUX["twist_mux"]
+  JOY["teleop_twist_joy"] -->|"/cmd_vel_joy (100)"| MUX
+  WEB["lupin_web"] -->|"/cmd_vel_manual (50)"| MUX
+  ZERO["sim zero guard"] -->|"/zero_cmd_vel (1)"| MUX
+  MUX -->|"cmd_vel_out · BEST_EFFORT"| BASE["base controller"]
+`} />
+
+The key design choice: **Nav2 never publishes to the controller directly.** Its `controller_server` emits on `/cmd_vel_nav`, the `velocity_smoother` smooths it and remaps the output to `/cmd_vel_auto`, the *lowest* real-traffic priority. So holding the Xbox dead-man instantly preempts autonomy, and the web joystick overrides it too, all through the same chain. The fourth input `/zero_cmd_vel` (priority 1) is the *sim-only* idle-stop guard: Gazebo's `planar_move` holds the last commanded twist forever once its input goes silent, so the sim bring-up publishes a constant zero that wins only when joy, manual, and auto have all timed out, halting the body instead of letting it drift. On hardware nothing publishes it and the base controller's own command timeout stops the wheels.
 
 <Callout type="warn">
-  The mux publishes its output **BEST_EFFORT**, because both the sim `twist_mux` and the
-  real mecanum controller subscribe BEST_EFFORT, a RELIABLE publisher would silently
-  drop every message on the QoS mismatch
-  (`lupin_hmi/cmd_vel_mux.py`). The web HMI publishes to `/cmd_vel_manual` (priority 50),
-  **not** to the controller topic, specifically so it shares this arbitration instead of
-  racing Nav2.
+  The mux publishes its output **BEST_EFFORT**, because both the sim driver and the real mecanum controller subscribe BEST_EFFORT. A **RELIABLE** publisher would *silently* drop every message on the QoS mismatch, the symptom is wheels idle even though `publish()` succeeds, no error. The web HMI publishes to `/cmd_vel_manual` (priority 50), **not** to the controller topic, specifically so it shares this arbitration instead of racing Nav2.
 </Callout>
 
-## The sim ↔ hardware boundary
+## The mission orchestrator FSM
 
-The repository keeps three long-lived branches (`main`, `sim`, `hardware`). The deep
-point is how *little* changes between simulation and the real robot. Everything that
-makes decisions is shared; only the edges differ.
+The orchestrator is a hierarchical state machine built on the `transitions` library (`lupin_mission/node.py`, the topology is a pure-data `build_hsm_spec()` so the docs exporter can render it without a ROS node). Top-level lifecycle states are `BOOT`, `READY`, `PREPARE`, `EXPLORING`, `INSPECTING`, `MONITORING`, `RETURNING`, `DONE`, `FAULT`. `INSPECTING` and `MONITORING` are *composite* states that each wrap the same `NAVIGATING` `SCANNING` `PUBLISHING` sub-machine and walk a tag sequence one leg at a time.
+
+<Mermaid chart={`
+stateDiagram-v2
+  [*] --> BOOT
+  BOOT --> READY: deps_up
+  READY --> PREPARE: start_mission
+  PREPARE --> EXPLORING: localized (exploration)
+  PREPARE --> INSPECTING: localized (inspection)
+  EXPLORING --> MONITORING: tags_discovered
+  EXPLORING --> RETURNING: no_frontiers (none found)
+  state INSPECTING {
+    [*] --> NAVIGATING
+    NAVIGATING --> SCANNING: nav_succeeded
+    NAVIGATING --> PUBLISHING: nav_unreachable
+    SCANNING --> PUBLISHING: scan_done
+    PUBLISHING --> NAVIGATING: next_tag
+  }
+  INSPECTING --> RETURNING: inspection_complete
+  state MONITORING {
+    [*] --> mNAV
+    mNAV --> mSCAN: nav_succeeded
+    mSCAN --> mPUB: scan_done
+    mPUB --> mNAV: next_tag
+  }
+  MONITORING --> RETURNING: abort_to_return
+  RETURNING --> DONE: returned
+  DONE --> READY: reset_for_next
+  FAULT --> READY: recover
+`} />
+
+The deep point is what *never* self-completes. `INSPECTING` walks its tag list once and fires `inspection_complete` to `RETURNING`. `MONITORING` reuses the identical sub-machine, but `MonitoringMission.is_complete()` stays `False`, so `PUBLISHING` loops back to the next leg forever, a continuous climate sweep rather than a one-shot inspection. **Pause** and **E-stop** are *flags*, not states, they freeze progress in place and only `/mission/resume` unblocks the orchestrator. A per-leg AMCL drift gate (`nav_localization_cov_threshold`, default 0.25) checks localization covariance before *each* `NavigateToPose` so the robot never drives to a goal computed from a stale pose, marking a leg `UNREACHABLE` instead. Battery-low and dock resume re-enter the mission *family* you left (`resume_monitoring` / `resume_exploration` / `resume_inspection`) without passing through `DONE`, so a monitoring loop doesn't end early. Full detail on the [Mission](/docs/mission) page.
+
+## The safety lane
+
+The highest-stakes wiring in the whole graph is the smallest. Autonomous e-stop used to be *decorative*: the orchestrator's `EStopMonitor` subscribed `/e_stop_state` (`std_msgs/Bool`) but **nothing** in production ever published it, and the HMI STOP button was a client-side `cmd_vel`-zeroing gate only. The physical button publishes `/io/intensity/emergency_button/digital` (`mirte_msgs/IntensityDigital`, **not** `Bool`) with zero subscribers. A cross-process seam no single-file review catches.
+
+`estop_bridge` (`lupin_hmi`, launched in `onboard.launch.py:121`) closes it: it subscribes the physical button *and* the HMI soft-stop `/lupin/hmi/estop`, and publishes their OR onto `/e_stop_state` at 5 Hz so a late-joining VOLATILE orchestrator always converges. `EStopMonitor` dedups on edges, so the steady repeats are harmless, and it cancels the in-flight Nav2 goal on the rising edge.
+
+<Callout type="warn">
+  **Hardware-only.** The button polarity (`engaged_value`) is a launch param logged loudly at startup because it MUST be verified on the real button: press it and confirm `/e_stop_state` goes `true`, flip the param if it does not. The bridge is the **single** `/e_stop_state` publisher, the physical OR HMI sources fold into it so there is no dual-publisher flapping.
+</Callout>
+
+Running alongside it, `battery_monitor.py` mirrors `/io/power/power_watcher` (`sensor_msgs/BatteryState`) onto a low/recovered flag pair. It normalises the percentage first (some MIRTE watchers publish 0..100, others emit NaN when only voltage is known) so the battery-low to dock net never silently disables itself, then fires a latched low edge below `battery_low_threshold` (default 0.20) that drives the orchestrator into a dock-and-pause `RETURNING` leg. Like the e-stop, recovery is operator-gated: the mission stays paused after the battery recovers until `/mission/resume`.
+
+## The approach-pose pipeline
+
+Tag locations arrive as `(x, y)` only, they don't say how to park the robot to scan the tag. In sim that's fine because the bridge is an oracle keyed by tag id, but on hardware the camera must actually *see* the AprilTag, so the goal *yaw* matters as much as the position. `approach.compute_approach` owns this geometry in three layers, pure Python so it unit-tests without rclpy:
+
+- **Geometry,** a tag belongs to the table whose bbox-centre it sits closest to; the table's outward normal points away from the plant bed; the goal pose is `tag + standoff * normal` with yaw aimed back at the tag, so the front camera frames it head-on. Standoff is clamped to `[0.2, 1.5]` m (100 mm tags lose detection reliability past that).
+- **Override,** `lupin_bringup/config/approach_overrides.yaml` lets a hardware operator pin a position or yaw per tag for an awkward aisle, `derived_from='override'` shows in the log.
+- **Fallback,** degenerate inputs (no tables in scope, a tag exactly at a table centre) punt to the orchestrator's global `approach_yaw` with `derived_from='fallback'`, loud but survivable, the mission still runs.
+
+## The sim vs hardware boundary
+
+The repository keeps three long-lived branches (`main`, `sim`, `hardware`). The deep point is how *little* changes between simulation and the real robot. Everything that makes decisions is shared; only the edges differ.
 
 **Identical across sim and hardware:**
 
-- All mission logic, the frontier planner, and the state machine (`lupin_mission`).
-- All perception nodes (`lupin_perception`), `tag_annotator` even runtime-selects the
-  OpenCV ArUco API so the same node runs on OpenCV 4.6 and 4.7+.
-- The digital twin (`lupin_twin`), it consumes only the abstract `Observation` stream,
-  so it has zero dependency on Nav2 or Gazebo and behaves the same in both.
-- The web HMI (`lupin_web`) and the entire `lupin_msgs` contract.
-- Nav2 params: `base_frame`/`robot_base_frame` is `base_link`, and the odometry topic is
-  `/mirte_base_controller/odom` (wheel-encoder odom) on both targets.
+- **All mission logic,** the frontier planner, the FSM, and the safety monitors (`lupin_mission`).
+- **Most perception,** `tag_annotator` runtime-selects the OpenCV ArUco API (`hasattr(cv2.aruco, 'ArucoDetector')`) so the *same* node runs on the 4.6 sim host and the 4.7+ laptop. The sim swaps **only** the flower detector (`sim_flower_detector` HSV stand-in versus the real `yolo_detector`, same `/yolo/detections` contract) because `best.pt` fires on nothing in Gazebo.
+- **The digital twin** (`lupin_twin`), it consumes only the abstract `Observation` stream, so it has **zero** dependency on Nav2 or Gazebo and behaves the same in both.
+- **The web HMI** (`lupin_web`) and the entire `lupin_msgs` contract.
+- **Odometry,** `base_frame` is `base_link` and the odom topic is `/mirte_base_controller/odom` on both targets (sim relays Gazebo's `/odom` to that name so it matches hardware 1:1).
 
 **What actually differs:**
 
 | Concern | Simulation | Hardware |
 | --- | --- | --- |
 | Bring-up | `sim_full.launch.py` (Gazebo + everything) | `hardware.launch.py` (laptop) + onboard systemd |
-| Drive topic | `/mirte_base_controller/cmd_vel_unstamped` | `/mirte_base_controller/cmd_vel` (stamped sink) |
-| Localization | `slam_toolbox` owns `/map` + `map→odom` | AMCL against a saved map (or SLAM) |
+| Drive sink | `/cmd_vel` into `gazebo_ros_planar_move` | `/mirte_base_controller/cmd_vel` (vendor controller) |
+| Localization | `slam_toolbox` owns `/map` + `map->odom` | AMCL against a saved map (or SLAM) |
 | AMCL pose | seeded synthetically by `seed_amcl_pose` | published naturally by a running AMCL |
-| Climate sensing | `mdp-greenhouse` oracle via the bridge | same bridge (real AprilTag IDs feed it) |
-| Visual gate | `require_visual_confirmation` left `false` | `true` → `/perception/confirm_tag` runs |
+| Flower detection | `sim_flower_detector` (HSV) | `yolo_detector` (Ultralytics) |
+| Visual gate | `require_visual_confirmation` left `false` | `true`, `/perception/confirm_tag` runs |
+
+### The one topic that differs: the drive sink
+
+This is the page's stated focus and the single most-bitten footgun on the stack. The **only** thing the drive plumbing changes between targets is `twist_mux`'s `cmd_vel_out` remap, set in the launch file:
+
+- **Hardware** (`onboard.launch.py:57`), `cmd_vel_out` to `/mirte_base_controller/cmd_vel`. The vendor `mirte_telemetrix_cpp` wires the controller's `~/cmd_vel` directly with **no** `_unstamped` remap, so the unstamped topic does not exist on the real robot.
+- **Sim** (`sim_robot.launch.py:72`), `cmd_vel_out` to `/cmd_vel`, which `gazebo_ros_planar_move` consumes. Under `greenhouse_sim.launch.py` Option A, the ros2_control mecanum controller is *deliberately not spawned*, `planar_move` is the single `odom->base_link` TF source and running the mecanum controller too would publish a second competing odom TF that Nav2 drops.
+
+<Callout type="error">
+  `sim_full.launch.py:451` remaps `cmd_vel_out` to `/mirte_base_controller/cmd_vel_unstamped`, a topic with **no** subscriber under Option A, that row is *legacy*, valid only for a ros2_control mecanum sim, not the planar_move path. The working sim drive path is `/cmd_vel` (`sim_robot.launch.py`). Naming intuition lies on this stack: a node that publishes only `/mirte_base_controller/cmd_vel_unstamped` drives perfectly in a mecanum sim and publishes into a *void* on hardware, no error, wheels silent. Always `ros2 topic info <topic> --verbose` to confirm a subscriber exists before plumbing, and publish through the `twist_mux` bus so arbitration picks the per-branch terminal topic for you.
+</Callout>
+
+The bring-up itself is event-driven, **no** fixed delays, every stage waits on a sentinel so you see exactly which stage stalled instead of drowning in retry warnings.
 
 <Tabs items={['Simulation','Hardware']}>
 <Tab value='Simulation'>
 
-One command brings up Gazebo, SLAM, Nav2, the bridge, the orchestrator, the twin, and the
-web HMI, with an event-driven sentinel cascade (`/scan` → SLAM → `/map` → Nav2):
+One command brings up Gazebo, SLAM, Nav2, the bridge, the orchestrator, the twin, and the web HMI, chained through an event-driven sentinel cascade:
 
 ```bash
 ros2 launch lupin_bringup sim_full.launch.py
 ```
 
-The drive sink is `/mirte_base_controller/cmd_vel_unstamped`, and because there is no AMCL
-in SLAM mode, `seed_amcl_pose` publishes one synthetic latched `/amcl_pose` to satisfy the
-orchestrator's localization gate.
+The cascade fires Gazebo and the orchestrator at `t=0`, then a `wait_for_scan` sentinel (`ros2 topic echo --once /scan`) gates `slam_toolbox`, then a `wait_for_map` sentinel (with explicit `--qos-reliability reliable --qos-durability transient_local` to match `/map`) gates Nav2 lifecycle activation. Because there is no AMCL in SLAM mode, `seed_amcl_pose` publishes one synthetic latched `/amcl_pose` to satisfy the orchestrator's localization gate, and the drive sink is `/cmd_vel` into `planar_move`.
 
 </Tab>
 <Tab value='Hardware'>
 
-The robot runs onboard systemd services on boot; the operator launches the rest from the
-laptop with one command and per-subsystem flags:
+The robot runs onboard systemd services on boot; the operator launches the rest from the laptop with one command and per-subsystem flags:
 
 ```bash
 ros2 launch lupin_bringup hardware.launch.py
 ```
 
-The drive sink is the stamped `/mirte_base_controller/cmd_vel`. A real AMCL publishes
-`/amcl_pose`, and the mission's `require_visual_confirmation` gate calls
-`/perception/confirm_tag` before each scan.
+The drive sink is `/mirte_base_controller/cmd_vel`. A real AMCL publishes `/amcl_pose`, the mission's `require_visual_confirmation` gate calls `/perception/confirm_tag` before each scan, and `estop_bridge` (started by the onboard unit) wires the physical button into `/e_stop_state`.
 
 </Tab>
 </Tabs>
 
+The sentinel cascade, drawn as a sequence so the *order* and the lack of fixed delays are explicit:
+
+<Mermaid chart={`
+sequenceDiagram
+  participant L as launch
+  participant G as Gazebo
+  participant WS as wait_for_scan
+  participant S as slam_toolbox
+  participant WM as wait_for_map
+  participant N as Nav2
+  participant O as orchestrator
+  L->>G: spawn world + robot
+  L->>O: start (idles in READY)
+  L->>WS: echo --once /scan
+  WS-->>S: /scan present, start SLAM
+  S->>WM: publishes /map
+  WM-->>N: /map present, activate lifecycle
+  N-->>O: costmaps + planner ready
+  O->>O: PREPARE clears on /amcl_pose seed
+`} />
+
 ## Robot-side vs laptop-side split
 
-Compute is deliberately split across the two machines. The robot keeps only what must be
-local to drive, actuate, and stream cameras the moment it boots; everything heavy and
-operator-facing runs on the laptop.
+Compute is deliberately split across the two machines. The robot keeps only what must be local to drive, actuate, and stream cameras the moment it boots; everything heavy and operator-facing runs on the laptop.
 
 <Mermaid chart={`
 graph TB
   subgraph ROBOT["ROBOT · Orange Pi · on boot"]
     direction TB
-    ON["lupin-onboard.service<br/>twist_mux · arm_preset<br/>arm_calibrate · gripper_bridge"]
+    ON["lupin-onboard.service<br/>twist_mux · arm_preset<br/>arm_calibrate · gripper_bridge · estop_bridge"]
     CAM["lupin-cameras.service<br/>Orbbec + gripper cams (low FPS)<br/>web_video_server :8091 MJPEG"]
     HOME["lupin-auto-home.service<br/>self-heal controllers · home arm"]
   end
@@ -204,43 +321,35 @@ graph TB
   ROBOT ==>|WiFi · MJPEG + DDS discovery| LAPTOP
 `} />
 
-The three onboard units (`lupin-onboard`, `lupin-cameras`, `lupin-auto-home`) are
-idempotent and `PartOf=mirte-ros`, so manual drive, arm, and gripper come up with the
-robot independent of any laptop. The camera service is a deliberate CPU win: it relaunches
-the cameras at config-driven low FPS on the *identical* vendor topic names and runs an
-on-robot `web_video_server`, so only MJPEG, never raw RGB, crosses the WiFi link.
-Details on the [Operations](/docs/operations) and [Networking](/docs/networking) pages.
+The three onboard units (`lupin-onboard`, `lupin-cameras`, `lupin-auto-home`) are idempotent and `PartOf=mirte-ros`, so manual drive, arm, gripper, and the e-stop bridge come up with the robot independent of any laptop. The camera service is a deliberate CPU win: it relaunches the cameras at config-driven low FPS on the *identical* vendor topic names and runs an on-robot `web_video_server`, so only MJPEG, never raw RGB, crosses the WiFi link. Details on the [Operations](/docs/operations) and [Networking](/docs/networking) pages.
 
 ## The latched-snapshot contract
 
-Three of Lupin's status topics share a deliberate QoS pattern: **RELIABLE +
-TRANSIENT_LOCAL** with depth 1 (latched). A late-joining subscriber, an HMI that just
-loaded, or an orchestrator that just started a mission, immediately receives the current
-state with no bootstrap round-trip. An empty array is a legitimate startup state, not an
-error.
+Three of Lupin's status topics share a deliberate QoS pattern: **RELIABLE + TRANSIENT_LOCAL** with depth 1 (latched). A late-joining subscriber, an HMI that just loaded, or an orchestrator that just started a mission, immediately receives the current state with no bootstrap round-trip. An empty array is a legitimate startup state, not an error. The rates are parameters, not fixed constants, the values below are defaults.
 
 | Topic | Type | Publisher | Why latched |
 | --- | --- | --- | --- |
-| `/twin/state` | `lupin_msgs/TwinState` | `lupin_twin` (~1 Hz) | A freshly-connected HMI gets the whole observed world at once. |
-| `/perception/discovered_tags` | `lupin_msgs/DiscoveredTags` | `perception_aggregator` (~2 Hz) | A mission that starts mid-run instantly sees the full tag registry. |
-| `/mission/state` | `lupin_msgs/MissionState` | `mission_orchestrator` (5 Hz) | A late HMI sees the current lifecycle/phase snapshot immediately. |
+| `/twin/state` | `lupin_msgs/TwinState` | `lupin_twin` (`state_publish_rate_hz` 1.0) | A freshly-connected HMI gets the whole observed world at once. |
+| `/perception/discovered_tags` | `lupin_msgs/DiscoveredTags` | `perception_aggregator` (`publish_rate_hz` 2.0) | A mission that starts mid-run instantly sees the full tag registry. |
+| `/mission/state` | `lupin_msgs/MissionState` | `mission_orchestrator` (`state_publish_rate_hz` 5.0) | A late HMI sees the current lifecycle/phase snapshot immediately. |
 
-`/floranova/observations` uses the same RELIABLE + TRANSIENT_LOCAL durability but with
-depth 50, so a late subscriber replays the whole mission so far rather than just the last
-reading.
+`/floranova/observations` uses the same RELIABLE + TRANSIENT_LOCAL durability but with **depth 50**, so a late subscriber (a twin restarted mid-mission) replays the whole mission so far rather than just the last reading.
 
 <Callout type="warn">
-  This pattern has a CLI gotcha. A native subscriber that defaults to VOLATILE durability
-  (e.g. a plain `ros2 topic echo`) will see *nothing* on first connect, because the
-  publisher is TRANSIENT_LOCAL. The web HMI consumes these via rosbridge and is
-  unaffected; from the CLI, match the durability explicitly.
+  This pattern has a CLI gotcha. A native subscriber that defaults to VOLATILE durability (a plain `ros2 topic echo`) sees *nothing* on first connect, because the publisher is TRANSIENT_LOCAL, match the durability explicitly with `--qos-durability transient_local`. The web HMI consumes these via `roslib.js`, which has **no** QoS API, so every web subscription is effectively VOLATILE too, it survives only because these topics also republish at their steady rate. Anything that needs the current value *immediately* must pull it via a service call, not lean on subscription durability.
 </Callout>
 
-The contract is also encoded in the message design itself: `Observation` is a polymorphic
-envelope keyed by `kind` (`KIND_TAG_READING` / `KIND_FLOWER` / `KIND_ANOMALY`), and a
-`geometry_msgs/Pose` with `orientation.w == 0` is the agreed in-band sentinel for "this
-pose was never observed", so consumers treat it as missing without a separate validity
-flag. See [Interfaces](/docs/interfaces) for the full message and service definitions.
+The contract is also encoded in the message design itself: `Observation` is a polymorphic envelope keyed by `kind` (`KIND_TAG_READING` / `KIND_FLOWER` / `KIND_ANOMALY`), and a `geometry_msgs/Pose` with `orientation.w == 0` is the agreed in-band sentinel for "this pose was never observed", so consumers treat it as missing without a separate validity flag.
+
+### Deliberately dead wiring
+
+Three contracts look like broken or half-finished wiring but are intentional, documented in `docs/CONTRACTS.md` so a future audit doesn't "fix" them into a regression:
+
+- **`KIND_ANOMALY` / `AnomalyReport`,** a locked-but-unproduced stub. Nothing emits a `KIND_ANOMALY` observation and the twin logs-and-drops it the first time one arrives. Pest detection today rides the *flower* path's `bug` boolean instead; standalone anomalies have no producer yet.
+- **`DiscoveredTag.species` / `DiscoveredTag.anomaly`,** producer-set, consumer-unread for logic. The aggregator fills them on every tag, but no consumer routes, filters, or decides on them, they exist only to mirror into `TwinTagState` for HMI display. Changing them affects *rendering* only, never the FSM.
+- **VOLATILE web subs versus TRANSIENT_LOCAL publishers,** a benign mismatch (see the callout above), the web client must not rely on the single latched backlog sample at connect time the way a native `transient_local` subscriber would.
+
+See [Interfaces](/docs/interfaces) for the full message and service definitions, and the [War stories](/docs/war-stories) page for the day the drive topic and the e-stop seams bit in the field.
 
 ## See also
 

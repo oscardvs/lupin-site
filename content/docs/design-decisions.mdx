@@ -1,0 +1,141 @@
+---
+title: Design Decisions
+description: The architecture decision records behind Lupin, why MPPI with Omni motion model over DWB on the mecanum base, why preset arm poses plus a custom calibration flow instead of MoveIt, why a custom twist_mux command bus at priority 100/50/10/1 retired the old cmd_vel_mux, why the lupin_web HMI is pure rosbridge with zero rclpy nodes, why a FastDDS discovery server replaces multicast for the laptop-robot link, why the drive inversion was fixed at the telemetrix pin level, why the KIND_ANOMALY and DiscoveredTag and VOLATILE-subscription contracts are deliberately dead-wired, and the pragmatic-v1 philosophy of shipping with documented limitations.
+---
+
+Every interesting choice in **Lupin** is a trade-off made under one constraint, a student-project deadline with a single robot and a graded demo at the end. The decisions below are the ones that *shape* the system, the controller that drives the wheels, the way the arm moves, the bus that arbitrates commands, the transport that carries the data, and the contracts we deliberately left half-wired. Each was reversible on paper and expensive in practice, so each got argued out once and then written down.
+
+This page is the **decision record**, ADR-style, one heading per choice with its Context, Decision, Why, and Trade-off, so a reviewer reading the code never has to reverse-engineer the intent. The companion failure stories that motivated several of these live in [war-stories](/docs/war-stories); the live behaviour they describe lives in [navigation](/docs/navigation), [teleop](/docs/teleop), and [web-hmi](/docs/web-hmi).
+
+## MPPI with an Omni motion model, not DWB
+
+**Context.** The base is a **mecanum** chassis, four independently driven wheels that let the robot translate sideways and yaw in place. Nav2 ships two stock local controllers, the older `DWB` sampling planner and the newer `MPPI` (Model Predictive Path Integral) controller, and the default tutorials and most field robots use `DWB`.
+
+**Decision.** Lupin runs `MPPI` from day one, configured with `motion_model: "Omni"`, and the `DWB` plugin is never loaded. The single source of truth is `lupin_navigation/config/nav2_params.yaml`, where `FollowPath` is bound to `nav2_mppi_controller::MPPIController` with `vx_max: 0.5`, `vy_max: 0.5`, and `wz_max: 1.9`.
+
+**Why.** A mecanum base's whole point is the lateral degree of freedom, and `DWB`'s default trajectory generators assume a differential-drive twist where `vy` is zero. The `Omni` motion model is the one knob that makes the controller *sample* sideways velocities at all, without it, `vy` samples are zeroed and the robot is reduced to a worse differential-drive bot that cannot strafe into an aisle or correct a small lateral offset at a goal. `MPPI` also handles the tight 0.5 m greenhouse aisles and the head-on AprilTag approach poses more gracefully than `DWB`'s discrete sampling, because it optimises a smooth control sequence rather than picking from a fan of pre-rolled arcs.
+
+**Trade-off.** `MPPI` is heavier per control cycle than `DWB` and its cost weights are subtle, the accel envelope has to be matched to the `velocity_smoother`'s caps or the smoother chops the very trajectories `MPPI` just optimised. We accept the tuning burden for the lateral mobility we cannot get otherwise. Full geometry of the controller stack is in [navigation](/docs/navigation).
+
+<Callout type="info">
+  `motion_model: "Omni"` is *not* cosmetic. It is the difference between a mecanum base and a differential one. The matching `robot_model_type: "nav2_amcl::OmniMotionModel"` in the same file keeps AMCL's prediction consistent with how the base actually moves.
+</Callout>
+
+## Preset arm poses plus a custom calibration flow, not MoveIt
+
+**Context.** The arm is a **4-DOF** Hiwonder manipulator with a 1-DOF gripper jaw. The vendor ships a `mirte_moveit_config`, and `ros-humble-moveit-*` is installed on the machine, so MoveIt was the obvious default for anything arm-shaped.
+
+**Decision.** Lupin drives the arm through named **preset poses** (`arm_preset_server.py`), a shared limit source (`arm_limits.py`), one trajectory builder (`arm_traj.py`), and a custom start/commit/cancel calibration service (`arm_calibrate_server.py`). MoveIt is firmly deferred, not used in any live path.
+
+**Why.** Four reasons stacked up and none of them survived contact with MoveIt. First, the task is camera-tilt and a top-down pick, *not* an arbitrary 6-DOF pose, and a 4-DOF arm physically cannot reach a full 6-DOF target, so MoveIt's KDL solver would refuse poses we never needed anyway. Second, the vendor `mirte_moveit_config` is defective out of the box. Third, MoveIt drives the *same* `JointTrajectoryController` that our preset server already commands, so it fixes *none* of the actual arm complaints, the thermal trip when `shoulder_lift` is held against gravity (see [war-stories](/docs/war-stories)), the slider seeding, the torque-enable gate. Fourth, it is a large dependency to carry for a motion a lookup table of joint angles handles in twenty lines.
+
+**Trade-off.** We give up collision-aware planning and inverse kinematics. If a tulip-picking scenario ever needs to thread the gripper around obstacles, MoveIt earns its place as a sim-only spike, that door is left open on purpose. Until then, presets plus calibration are the honest amount of machinery for the job.
+
+<Callout type="warn">
+  The `shoulder_lift` servo latches into a torque-on, commands-ignored state when held against gravity and only a hard power-cycle clears it. Auto-homing to a safe pose on boot mitigates the trip, no planner, MoveIt included, recovers from it, because the fault is in the servo, not the trajectory.
+</Callout>
+
+## A custom twist_mux command bus that retired cmd_vel_mux
+
+**Context.** Three different things want to drive the chassis, the Xbox dead-man teleop, the web HMI joystick widget, and Nav2's autonomy output, and exactly one of them may own the wheels at any instant. The project started with a hand-written `cmd_vel_mux.py`.
+
+**Decision.** That custom node is retired. Arbitration now runs through the standard `twist_mux` package, configured in `lupin_hmi/config/twist_mux.yaml` with four prioritised inputs feeding one output.
+
+| Input topic | Priority | Timeout | Role |
+| --- | --- | --- | --- |
+| `/cmd_vel_joy` | 100 | 0.3 s | Xbox dead-man, the **operator override** that beats everything |
+| `/cmd_vel_manual` | 50 | 0.5 s | web HMI joystick, the remote operator |
+| `/cmd_vel_auto` | 10 | 0.5 s | Nav2 `velocity_smoother`, autonomy |
+| `/zero_cmd_vel` | 1 | 1.0 s | sim-only idle-stop guard, dormant on hardware |
+
+The selected twist is remapped in the launch file to `/mirte_base_controller/cmd_vel_unstamped` in sim and `/mirte_base_controller/cmd_vel` on the real robot, the *one* drive-topic difference between the two targets, covered in [teleop](/docs/teleop).
+
+<Mermaid chart={`
+graph LR
+  JOY["/cmd_vel_joy<br/>Xbox dead-man · 100"]
+  MAN["/cmd_vel_manual<br/>web HMI · 50"]
+  AUTO["/cmd_vel_auto<br/>Nav2 · 10"]
+  ZERO["/zero_cmd_vel<br/>sim idle-stop · 1"]
+  MUX{"twist_mux<br/>highest active wins"}
+  OUT["base controller<br/>cmd_vel"]
+  JOY --> MUX
+  MAN --> MUX
+  AUTO --> MUX
+  ZERO --> MUX
+  MUX --> OUT
+`} />
+
+**Why.** `twist_mux`'s priority-plus-timeout semantics are exactly the right primitive and they are maintained upstream, so we delete code instead of owning it. The timeouts are deliberate, not defaults. The Xbox launch uses `enable_button=2` so `/cmd_vel_joy` goes *completely silent* the instant LT is released, the 0.3 s timeout then elapses and Nav2 or the web reclaims the bus, snappy for a human releasing a trigger. The web's 0.5 s window suits its ~10 Hz rosbridge rate, and the auto 0.5 s matches the vendor's downstream timeout. The lowest input, `/zero_cmd_vel` at priority 1, only wins when *every* real source has timed out, so the Gazebo `planar_move` driver halts instead of coasting on its last twist, a pure sim concern that publishes nothing on hardware.
+
+**Trade-off.** The whole scheme leans on a dead-man that produces *no* frames when released. If we ever drop the dead-man so `joy_node` streams all-zero Twists continuously, priority 100 would pin the bus and silently out-vote Nav2 and the web, the same failure class as an HMI that floods a zero heartbeat (the [war-stories](/docs/war-stories) "silently blocks every drive path"). The arbitration is correct, the *contract* with each publisher about going silent is the load-bearing part.
+
+## A pure-rosbridge HMI with zero rclpy nodes
+
+**Context.** The operator console, `lupin_web`, is a Vite single-page app served as a static `dist/` artifact. It needs to read telemetry, drive the base, move the arm, and call mission services.
+
+**Decision.** `lupin_web` ships **zero** `rclpy` nodes. Its launch file starts a static file server on `:8090`, a `web_video_server` on `:8091`, and (optionally) a co-located `rosbridge_websocket` on `:9090`, and that is the entire process list. Every operator action is a `rosbridge` publish, subscribe, or service call issued from `roslib.js` in the browser, the ROS-side code is `lupin_hmi` (the bridges and preset servers), not the web package.
+
+**Why.** Keeping the UI a pure rosbridge *client* means the browser is the only consumer and the ROS graph stays language-agnostic, no Python process to crash, no node to keep alive, no second place where joint limits or topic names could drift out of sync. It also lets the HMI move hosts cleanly, when it runs on the operator's laptop, rosbridge co-locates there and the Pi stops doing JSON encoding for the `/tf`, `/scan`, and `/joint_states` flood, moving that load to a machine with CPU to spare ([networking](/docs/networking) covers the split).
+
+**Trade-off.** `roslib.js` exposes *no* QoS API, so every HMI subscription is effectively `VOLATILE`, which collides with our latched publishers, documented as a deliberate contract below. We accept a thin browser client that cannot tune durability in exchange for a UI with no server-side ROS surface to maintain. Full tile-by-tile behaviour is in [web-hmi](/docs/web-hmi).
+
+## A FastDDS discovery server for the laptop-robot link
+
+**Context.** ROS 2's default discovery is **multicast**, every participant shouts on the LAN to find every other. On a wired demo LAN and an eduroam-adjacent WiFi, multicast is unreliable or outright filtered, and the laptop-robot pair is the one link that must never flake during a demo.
+
+**Decision.** The robot runs a **FastDDS discovery server** listening on `0.0.0.0:11811` (all interfaces, verified), with `MIRTE_FASTDDS=true` set on the robot and `ROS_DISCOVERY_SERVER=10.42.0.1:11811` exported into the laptop's environment. Discovery is point-to-point against a known endpoint, not broadcast.
+
+**Why.** A discovery server turns "hope the multicast packets land" into "connect to this IP and port," which is deterministic across a travel router, the robot's own AP, or a wired switch, the link behaves the *same* regardless of how the laptop reached the robot. It also sidesteps multicast filtering on managed networks entirely.
+
+**Trade-off.** The robot now owns a single point of failure, if the vendor's fire-and-forget boot script loses the cold-boot race, *nothing* binds `:11811` while `mirte-ros` still reports `active`, and the whole DDS graph silently has no rendezvous point (the [war-stories](/docs/war-stories) "lost the boot race"). The discovery-server URL must be set in *every* shell's environment, and a node's DDS mode is frozen at launch from that environment, so a rosbridge started in a terminal missing the env goes blind. The runbook for both lives in [networking](/docs/networking).
+
+<Callout type="warn">
+  A node reads `ROS_DISCOVERY_SERVER` *once*, at launch. A fresh shell that has the variable set tells you nothing about a long-running process, check `/proc/<pid>/environ` to know what a node actually sees.
+</Callout>
+
+## Fixing the drive inversion at the source, not in the HMI
+
+**Context.** On Mirte-247264 the base drove *backwards* relative to its odometry, the map looked right but the robot ran the wrong way, a classic 180-degree base-frame inversion. The quick fix is to flip the sign of every command and reading on the HMI surface.
+
+**Decision.** The inversion is fixed at the **source**, a matched telemetrix pin-swap on all four wheels, motor leads `p1`/`p2` swapped *and* encoder channels A/B swapped together, so odometry equals physical motion from the lowest layer up. The HMI flip (`polarityInvertHmi`) is set back to `false` and the Xbox scales are positive.
+
+**Why.** A downstream flip in the HMI compensates *one* consumer and leaves every other consumer wrong, Nav2, RViz, the digital twin, raw `cmd_vel`. Worse, two flips in series double-compensate and the bug comes back looking like a new one. Fixing the pin map makes the whole stack agree at once, with no per-surface sign bookkeeping to forget. The motor and encoder must be swapped *together*, swapping only the motor without the encoder builds a positive-feedback loop and the wheel runs away.
+
+**Trade-off.** A source fix touches firmware-adjacent config and is per-robot, a different chassis with correct wiring must *not* inherit the swap. We accept a hardware-specific calibration in exchange for a stack where odometry, navigation, and teleop all share one true frame. Details are in [hardware](/docs/hardware).
+
+## Deliberately dead-wired contracts
+
+**Context.** Three message contracts in the repo look like broken or half-finished wiring. Left unexplained, a future audit "fixes" them into regressions.
+
+**Decision.** They are intentional and documented in `lupin/docs/CONTRACTS.md`. The summary, so nobody hunts for missing logic:
+
+- **`Observation.KIND_ANOMALY` / `AnomalyReport`**, a locked contract with *no* producer. Nothing emits an `Observation` with `kind == KIND_ANOMALY`, and `lupin_twin` logs-and-drops the kind if one ever arrives. Pest detection rides the *flower* path instead, the gripper YOLO classifier raises a `bug` flag that surfaces as `DiscoveredTag.anomaly`. Standalone anomalies, a fallen plant, an obstruction, simply have no producer yet.
+- **`DiscoveredTag.species` / `DiscoveredTag.anomaly`**, producer-set, consumer-unread for logic. `perception_aggregator` fills `species`, `species_confidence`, and `anomaly` on every `DiscoveredTag`, but *no* consumer uses them for routing, filtering, or any mission decision. They exist only to mirror into `TwinTagState` for HMI display, changing them affects *rendering* only, never the state machine.
+- **VOLATILE web subscriptions against TRANSIENT_LOCAL publishers**, a deliberate QoS mismatch. Several Lupin publishers are `RELIABLE + TRANSIENT_LOCAL` (latched), `/twin/state`, `/mission/state`, `/perception/discovered_tags`, `/tf_static`, while every `roslib.js` subscription is `VOLATILE`. This is benign because the latched state topics also republish at ~1 Hz, so a freshly connected HMI fills within a publish cycle. Anything that needs the current value *immediately* pulls it via a service call, it never leans on subscription durability.
+
+**Why.** Documenting intentional asymmetry is cheaper than re-deriving it. Each of these is a contract surface left in place so the wiring can be completed later without a message-definition change, the *shape* is ready, the producer or consumer is deliberately absent.
+
+**Trade-off.** A reader has to trust a note instead of reading live logic, so the note has to exist and be findable, which is why it is a tracked file and why it is repeated here. Field definitions are in [interfaces](/docs/interfaces).
+
+<Callout type="info">
+  The rule for the web client, never rely on receiving the single latched backlog sample at connect time the way a native `transient_local` subscriber would. Pull current values through a service call, lean on the ~1 Hz republish for everything else.
+</Callout>
+
+## Pragmatic v1 over fighting the vendor
+
+**Context.** The MIRTE platform is a vendor stack with its own quirks, a P3D teleport plugin in the URDF, a BRG-wired LED strip, lazy-publishing cameras, a discovery-server boot race, a thermal-tripping servo. Each could be chased to a "proper" upstream fix.
+
+**Decision.** Ship a **v1** that works with the vendor's behaviour and *document* the limitation, rather than re-architect the vendor stack to make a quirk disappear. Compensate at our own chokepoint, the `color_order: 'BRG'` param on our LED bridge rather than patching the vendor C++, our own `web_video_server` on `0.0.0.0:8091` rather than rebinding the vendor's localhost-only one, an auto-home on boot rather than a servo firmware fix.
+
+**Why.** The deadline is real and the vendor surface is large, every hour spent making a quirk "correct" upstream is an hour not spent on the mission, the twin, or the demo. A compensation at our boundary is *visible*, scoped, and per-robot tunable, and it leaves the vendor stack untouched so a vendor update does not fight our patch.
+
+**Trade-off.** Each compensation is a small piece of debt, a documented limitation a future maintainer must know about, and the [war-stories](/docs/war-stories) page exists precisely so that debt is paid forward as knowledge rather than rediscovered at 2 a.m. We choose a working demo with honest footnotes over a perfect stack that ships late.
+
+## See also
+
+<Cards>
+  <Card title="War Stories" href="/docs/war-stories" />
+  <Card title="Navigation" href="/docs/navigation" />
+  <Card title="Networking" href="/docs/networking" />
+  <Card title="Interfaces" href="/docs/interfaces" />
+</Cards>
