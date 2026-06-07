@@ -7,8 +7,8 @@ description: Every custom message and service in lupin_msgs, the typed contracts
 that holds **every** custom ROS 2 message and service in the Lupin stack. It
 ships no nodes and no launch files, only the typed contracts that the mission
 orchestrator, perception aggregator, digital twin, and arm servers link against.
-Ten messages and six services are generated over `std_msgs`, `geometry_msgs`,
-`sensor_msgs`, and `builtin_interfaces`.
+Eleven messages and eleven services are generated over `std_msgs`,
+`geometry_msgs`, `sensor_msgs`, and `builtin_interfaces`.
 
 This page is the reference for all of them. Every field below is taken verbatim
 from the `.msg` / `.srv` source.
@@ -188,11 +188,28 @@ geometry_msgs/PoseStamped pose             # map-frame pose of the co-located ta
 string species                             # "tulip_red" | "tulip_white" | "tulip_pink"; "" if none
 float32 confidence                         # classification confidence [0, 1] for `species`
 bool anomaly                               # true when the YOLO "bug" class co-located with this tag
+FlowerPoint[] flowers                      # per-bloom dots scattered inside the planter box (see FlowerPoint)
+geometry_msgs/Polygon box_footprint        # tag-anchored planter-box rectangle, map frame
 ```
 
 The `anomaly` bool rides the flower path (not `AnomalyReport`) because it is keyed
 by the same `tag_id` the twin merges on; standalone anomalies still use
 `KIND_ANOMALY`.
+
+### FlowerPoint
+
+One localized bloom inside a planter box, produced by `perception_aggregator`
+from tag-anchored box geometry plus a lateral cue. Carried as the repeated
+`flowers` field on both [`FlowerObservation`](#flowerobservation) and
+[`TwinTagState`](#twintagstate) so the HMI can scatter species-coloured dots
+inside the box rectangle instead of stacking every bloom on the tag pin.
+
+```text
+geometry_msgs/Point position   # map frame (z is 0 in v1 — 2-D placement)
+string species                 # "tulip_red" | "tulip_white" | "tulip_pink"; "" if only the "bug" class
+float32 confidence             # [0, 1] for `species`
+bool anomaly                   # the "bug" class co-located in this column
+```
 
 ### AnomalyReport
 
@@ -312,6 +329,8 @@ float32 stale_seconds                      # (now - last_observed) at publish ti
 string species                             # YOLO dominant class; "" until classified
 float32 species_confidence                 # [0, 1]; 0.0 when species is empty
 bool anomaly                               # YOLO "bug" class seen at this tag (latest-wins)
+FlowerPoint[] flowers                      # per-bloom dots scattered inside the planter box (see FlowerPoint)
+geometry_msgs/Polygon box_footprint        # tag-anchored planter-box rectangle, map frame
 ```
 
 The twin caches `pose` from the first OK observation and does not re-stamp it, so
@@ -369,8 +388,11 @@ string message
 ```
 
 <Callout type="info">
-  The gripper jaw is **not** driven by this service, command it directly via
-  `/io/servo/hiwonder/gripper/set_angle_with_speed`.
+  The gripper jaw is **not** driven by this service. Command it through the
+  bridge at `/lupin/gripper/set_angle_with_speed` (which drives the
+  `GripperActionController`) — **not** the raw
+  `/io/servo/hiwonder/gripper/set_angle_with_speed`, which fights the controller
+  on hardware. See [the gripper command path](/docs/teleop#the-gripper-command-path).
 </Callout>
 
 ### CalibrateArm
@@ -405,6 +427,88 @@ The `action` values:
 
 `joint_names`, `offsets_applied`, and `diffs_observed` populate **only** on a
 successful `commit`, in server-side joint order.
+
+### Arm pose & sequence library
+
+Five services back the Arm tab's **Pose Library** and **Sequence Recorder**
+cards (and the voice agent's library tools). They are served by
+`arm_library_server`, which runs **laptop-side** and owns
+`~/.config/lupin/arm_library.json` — operator state, deliberately kept off the
+robot (the built-in presets stay in the onboard `arm_preset_server`).
+
+#### GetArmLibrary
+
+List saved poses and sequences — names + light metadata only, never the
+waypoint data.
+
+```text
+---
+bool success
+string json     # {"poses":[{name,note,has_gripper}], "sequences":[{name,mode,duration_s,n_waypoints,include_gripper}]}
+```
+
+#### SaveArmPose
+
+Save a named arm pose. `from_current=true` snapshots the latest `/joint_states`
+(the UI/voice default); otherwise `arm_rad` (length 4, `ARM_JOINTS` order) and,
+when `has_gripper`, `gripper_rad` are used. Radians throughout.
+
+```text
+string name
+bool from_current
+float64[] arm_rad
+float64 gripper_rad
+bool has_gripper
+bool overwrite
+---
+bool success
+string message
+```
+
+#### ArmRecord
+
+Control a sequence recording. `action` is `start` | `save` | `cancel`; `mode`
+(start only) selects `kinesthetic` (torque OFF — hand-pose the arm) or `teleop`
+(torque ON).
+
+```text
+string action
+string name
+string mode
+bool include_gripper
+bool overwrite
+---
+bool success
+string message
+float64 duration_s
+int32 n_waypoints
+```
+
+#### PlayArmSequence
+
+Replay a saved sequence. `speed` scales playback time, clamped to `[0.25, 2.0]`.
+
+```text
+string name
+float64 speed
+---
+bool success
+string message
+```
+
+#### ArmLibraryEdit
+
+Delete or rename a library entry. `kind` is `pose` | `sequence`; an empty
+`new_name` deletes, a non-empty one renames.
+
+```text
+string kind
+string name
+string new_name
+---
+bool success
+string message
+```
 
 ---
 

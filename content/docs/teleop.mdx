@@ -91,7 +91,7 @@ Two de-confliction decisions are load-bearing:
 `joy_node` runs with `deadzone: 0.15` and `autorepeat_rate: 20.0`. The 0.15 deadzone covers the Series X|S pad's resting BT-mode drift; the joy default of `0.05` was too tight and let stick drift × `scale_angular` spin the chassis in place while LB was held.
 
 <Callout type="warn">
-  `scale_linear`/`scale_angular` in `config/xbox_config.yaml` are **negative** (`-0.2` / `-0.7`, turbo `-0.6` / `-1.4`). This mirrors the HMI `polarityInvertHmi` flip on Mirte-247264, whose mecanum drive is wired with motor and encoder leads reversed in pairs, the vendor `cmd_vel` frame is rotated 180° about Z relative to the physical chassis. Without the sign flip, pushing the stick forward drives the robot backwards.
+  `scale_linear`/`scale_angular` in `config/xbox_config.yaml` are **positive** (`0.2` / `0.7`, turbo `0.6` / `1.4`). Mirte-247264's mecanum drive was originally wired with motor and encoder leads reversed in pairs, rotating the vendor `cmd_vel` frame 180° about Z, and these scales used to be negative to compensate. That inversion was **fixed at the source** (telemetrix motor `p1`/`p2` + encoder `A`/`B` pin-swap, 2026-06-01), so the `cmd_vel` frame now matches the physical chassis and the scales are plain positive — pushing the stick forward drives forward. The same file feeds sim via `xbox_teleop.launch.py`, which never had the flip.
 </Callout>
 
 `joy_node` is launched with `respawn=True` so that, paired with the `lupin_bringup` udev rebind rule, powering the pad on after boot brings teleop back without a service restart.
@@ -101,7 +101,7 @@ Two de-confliction decisions are load-bearing:
 `arm_teleop` (`lupin_hmi/arm_teleop.py`) drives the 4-DOF arm and the 1-DOF gripper directly from `/joy`. It is an open-loop integrator:
 
 - Each active tick advances a joint by `step_rad` (default `0.15`, Xbox launch `0.15`) at `update_rate_hz` (default `10.0` Hz, matching the vendor `controller_manager` tick).
-- Every joint is clamped to ±1.5707 rad (the URDF ±π/2 limit).
+- Every joint is clamped to its **real per-joint window** via the shared `clamp_arm_joint` (`arm_limits`) — the asymmetric Hiwonder servo software limit intersected with the ±π/2 URDF envelope (e.g. shoulder-lift `−86°…+85°`), the same clamp the HMI sliders and presets use — so a held stick can't drive a joint into a pose the servo silently rejects.
 - It **seeds the commanded pose from `/joint_states` before sending anything** and refuses to publish until all four arm joints have been observed.
 - On the idle→active edge it re-seeds a joint from live `/joint_states`, so a tap is one clean step rather than a jump from a gravity-sagged setpoint.
 - Every trajectory point carries a non-zero velocity (`joint_velocity`, default `1.0`, Xbox launch `2.0`) to bypass the Hiwonder Telemetrix "velocity 0.0" rejection.
@@ -123,19 +123,47 @@ HMI slider
 
 | Service | Type | Purpose |
 | --- | --- | --- |
-| `/lupin/arm/<joint>/set_angle_with_speed` | `mirte_msgs/srv/SetServoAngleWithSpeed` | HMI per-joint arm slider → 4-joint `JointTrajectory` (deg→rad, clamp ±π/2) |
+| `/lupin/arm/<joint>/set_angle_with_speed` | `mirte_msgs/srv/SetServoAngleWithSpeed` | HMI per-joint arm slider → 4-joint `JointTrajectory` (deg→rad, clamp to the real per-joint window) |
 | `/lupin/gripper/set_angle_with_speed` | `mirte_msgs/srv/SetServoAngleWithSpeed` | HMI gripper slider (±30° → URDF range → `GripperCommand`) |
 | `/lupin/arm/init` | `std_srvs/srv/Trigger` | Drive the arm to URDF zero over 5 s |
 
 <Callout type="warn">
-  On the first `/joint_states` covering all four arm joints, the bridge publishes one **startup-pin** trajectory holding the *current* pose, so the `JointTrajectoryController`'s internal setpoint matches reality. Without it, the vendor hardware interface (`servo_moved_dead_band` 0.05 rad) re-asserts its stale near-zero command and snaps the arm back. Arm commands are dropped (`status=False`) until `/joint_states` has seeded all joints. The bridge runs on hardware under its own systemd unit, `lupin-gripper-bridge.service` (`Requires=mirte-ros.service`, `MemoryMax=128M`).
+  On the first `/joint_states` covering all four arm joints, the bridge publishes one **startup-pin** trajectory holding the *current* pose, so the `JointTrajectoryController`'s internal setpoint matches reality. Without it, the vendor hardware interface (`servo_moved_dead_band` 0.05 rad) re-asserts its stale near-zero command and snaps the arm back. Arm commands are dropped (`status=False`) until `/joint_states` has seeded all joints. The bridge runs on hardware inside **`lupin-onboard.service`** (alongside `twist_mux` + `arm_preset_server`, launched by `onboard.launch.py`; `PartOf=mirte-ros.service`, `MemoryMax=256M`).
+</Callout>
+
+### The arm slider command path
+
+The Arm tab's per-joint sliders never command a servo directly. Every slider release becomes one `mirte_msgs/srv/SetServoAngleWithSpeed` call, which the same `gripper_action_bridge` folds into a whole-arm `JointTrajectory` for the `JointTrajectoryController` (JTC) to execute. ros2_control owns the motion; the HMI only ever sends a *target angle*. Following the **shoulder-lift** slider end to end:
+
+```text
+Arm slider (commit on release)        ArmView.tsx → useRos().callService
+   → /lupin/arm/shoulder_lift/set_angle_with_speed   (SetServoAngleWithSpeed {angle, rate, degrees:true})
+   → rosbridge :9090                  (JSON service call → DDS, over the FastDDS discovery-server graph)
+   → gripper_action_bridge._handle_arm_set_angle('shoulder_lift', …)
+        deg→rad · clamp_arm_joint(real per-joint window) · fold into the 4-joint commanded pose
+        move time = max(0.1 s, |Δangle| / rate)
+   → /mirte_master_arm_controller/joint_trajectory   (trajectory_msgs/JointTrajectory, single point)
+   → JointTrajectoryController → ros2_control @ 10 Hz → Hiwonder Telemetrix HW interface → the servo moves
+   → joint_state_broadcaster publishes /joint_states  ──▶ back to the slider's "current" readout + status badge
+```
+
+Five behaviours make this safe and lurch-free:
+
+- **It is armed, not live.** Each slider is disabled until rosbridge is connected, the E-stop is clear, **and** torque is on. Torque reads `unknown` on every mount, *including* an in-app tab-switch remount, and `unknown` blocks the sliders, so a return to the Arm tab can never re-arm a freshly-seeded slider. Pressing **Enable** calls `/lupin/arm/set_torque {true}`, which re-pins the commanded pose to the current pose *before* re-energising (no lurch) and then drives the vendor `/io/servo/hiwonder/enable_all_servos`.
+- **The thumb tracks reality until you grab it.** Before first touch each slider seeds its target from live `/joint_states`, so it never starts from a phantom 0°. Its range is the **real asymmetric servo window** from `arm_limits.py` (shoulder-lift `−86°…+85°`), not a blanket ±90°, so the slider can't request a pose the Hiwonder servo would silently reject.
+- **One joint in, four joints out.** The bridge keeps an authoritative 4-joint *commanded* pose. `_commanded_with_override` overrides only the joint you moved and holds the other three at their last commanded value, except it re-syncs any joint that fresh `/joint_states` shows another surface (teleop, a preset, calibration) moved by more than `0.08 rad`. Until that pose is seeded it returns `status=False` and the slider shows *"rejected — joint not seeded."*
+- **The rate slider sets slew speed, not torque.** Travel time is `max(0.1 s, |Δangle| / rate)`; the JTC interpolates from the current setpoint to the target over that window. The trajectory point carries a non-zero velocity hint because the Hiwonder Telemetrix interface rejects `velocity 0.0`.
+- **Status is closed-loop, not a fire-and-forget ack.** The `moving → settled → ⚠ stalled` badge is derived from `/joint_states` convergence (`|current − target| ≤ 3°`), not from the service reply. The RPC returns `True` the instant the trajectory is published, so convergence is the only honest signal, and a joint that never arrives within its expected travel time is exactly how a silent servo reject or a `shoulder_lift` thermal trip surfaces in the UI.
+
+<Callout type="info">
+The bridge re-syncing untouched joints from feedback is what lets the HMI sliders, the Xbox arm teleop, and the arm presets all share one arm without fighting: whichever surface last moved a joint, the others adopt that value instead of yanking it back to a stale setpoint.
 </Callout>
 
 ## Arm presets
 
 `arm_preset_server` (`lupin_hmi/arm_preset_server.py`) exposes `/lupin/arm/preset` (`lupin_msgs/srv/SetArmPreset`). A caller asks for a pose by name, `{name: 'home'}`, without knowing joint angles, and the node publishes a `JointTrajectory` to `/mirte_master_arm_controller/joint_trajectory` over `PRESET_TRAVEL_SECONDS = 3.0` s. The same output topic works on the sim's Gazebo JTC and the real Hiwonder serial-bus JTC with no branching.
 
-Five static presets, in joint order `shoulder_pan` / `shoulder_lift` / `elbow` / `wrist` (radians):
+Six static presets, in joint order `shoulder_pan` / `shoulder_lift` / `elbow` / `wrist` (radians):
 
 | Preset | Pose (rad) | Use |
 | --- | --- | --- |
@@ -144,6 +172,7 @@ Five static presets, in joint order `shoulder_pan` / `shoulder_lift` / `elbow` /
 | `tuck` | `(0, -1.40, 1.40, 0)` | Arm folded over the base footprint |
 | `pick` | `(0, -0.60, 0.80, -0.40)` | Extended forward, wrist level for a top-down approach |
 | `place` | `(0, 0.20, 0.80, -0.40)` | Extended forward, wrist raised to clear table edges |
+| `inspect` | `(0, -0.40, 0.90, -0.80)` | Reaches forward and pitches the wrist down so the gripper camera frames a pot from above; the mission's per-pot arm-patrol pose (`arm_patrol_enabled`) |
 
 The gripper is intentionally **not** driven by presets, pick-and-place sequences interleave preset arm moves with explicit gripper open/close calls.
 

@@ -56,7 +56,7 @@ The frontend defaults its rosbridge URL to the same-origin proxy path `ws(s)://<
 A persistent top bar (logo, rosbridge pill, battery pill, clock, settings gear, and the permanent E-STOP) wraps seven tabs:
 
 - **Teleop**, two virtual joysticks (left = linear x/y, right = angular z), live Twist readout, speed-scale slider, mirrored stop button. Publishes to `cmdVelTopic` at 20 Hz while a stick is active. See [Teleop & manual control](/docs/teleop).
-- **Arm**, per-joint sliders for the 4-DOF Hiwonder arm (shoulder pan/lift, elbow, wrist) plus the gripper jaw, calling `mirte_msgs/srv/SetServoAngleWithSpeed` through `/lupin/arm/<joint>/set_angle_with_speed` and `/lupin/gripper/set_angle_with_speed`. Init, enable/disable torque, and operator-in-the-loop calibration live here too.
+- **Arm**, per-joint sliders for the 4-DOF Hiwonder arm (shoulder pan/lift, elbow, wrist) plus the gripper jaw, calling `mirte_msgs/srv/SetServoAngleWithSpeed` through `/lupin/arm/<joint>/set_angle_with_speed` and `/lupin/gripper/set_angle_with_speed`. Init, enable/disable torque, and operator-in-the-loop calibration live here too. See [The arm slider command path](/docs/teleop#the-arm-slider-command-path).
 - **Voice**, push-to-talk console wired to Google's Gemini Live API. See **Voice agent** below.
 - **Cameras**, MJPEG stream pulled from `web_video_server`'s `/stream?topic=` endpoint (not a direct rosbridge subscription). An "Overlay AprilTags" switch renders corner boxes + ID + range from `/camera/tag_detections_json` (`std_msgs/msg/String`, a JSON array packed by `lupin_perception/tag_annotator`).
 - **Telemetry**, top-down Lidar canvas (`/scan`), IMU (`/io/imu/movement/data`), Odometry (`/mirte_base_controller/odom`), Battery + voltage sparkline (`/io/power/power_watcher`), and arm joints (`/joint_states`).
@@ -152,7 +152,7 @@ Append `?mock=1` to the URL (or run `npm run dev -- --mode mock`) and `RosProvid
 
 ## Hardware polarity
 
-On Mirte-247264 the wheel wiring is inverted, so the HMI corrects it **at the human-facing surface only**. With the `polarityInvertHmi` setting on (default `true` on hardware, `false` in sim), joystick and voice `cmd_vel`, map-click goals, and the map view are flipped 180° about Z. The internal Nav2/SLAM frame is left untouched, it stays internally consistent. There are no sign hacks downstream of this single setting.
+Mirte-247264's mecanum drive was originally wired with motor and encoder leads reversed in pairs, which rotated the vendor `cmd_vel` frame 180° about Z. That inversion was **fixed at the source** (telemetrix `p1`/`p2` + encoder `A`/`B` pin-swap, 2026-06-01), so the drive frame now matches the physical chassis and **`polarityInvertHmi` defaults `false`** everywhere — a stale persisted `true` from an older install is dropped on load. The setting survives only as an escape hatch: turning it on flips joystick and voice `cmd_vel`, map-click goals, and the map view 180° about Z **at the human-facing surface only**, leaving the internal Nav2/SLAM frame untouched. There are no sign hacks downstream of this single setting.
 
 ## Running it
 
