@@ -1,6 +1,6 @@
 ---
 title: Web HMI & voice
-description: The browser mission console served on :8090, a cinematic data-reactive cockpit with a living WebGL aurora, a 3D digital twin, seven tabs over rosbridge, browser-side TF walking, a two-layer software E-stop wired to the mission orchestrator via estop_bridge and /e_stop_state, a 22-tool Gemini Live voice agent, the arm pose and sequence library, LED control, and the AprilTag camera overlay.
+description: The browser mission console served on :8090, a cinematic data-reactive cockpit with a living WebGL aurora, a 3D digital twin, seven tabs over rosbridge, browser-side TF walking, a two-layer software E-stop wired to the mission orchestrator via estop_bridge and /e_stop_state, a 23-tool Gemini Live voice agent, the arm pose and sequence library, LED control, and the AprilTag camera overlay.
 ---
 
 The Lupin **web HMI** is a single-page mission console, Vite + React + Tailwind + shadcn/ui, that talks to ROS 2 entirely over rosbridge. There are no `rclpy` nodes inside the SPA itself, every operator action becomes a rosbridge publish, subscribe, or service call, so the cockpit runs unchanged whether it is served from the robot or from the operator's laptop. This page is the reference for the whole surface, the tabs and the topics behind them, the two-layer E-stop, the voice tool dispatch, the arm arming gate and pose library, and the launch matrix that decides which processes spawn where.
@@ -114,7 +114,7 @@ The default topics in `settings.ts` target the topics that actually have publish
 
 ### LED control
 
-The Map tab also carries the **LightControl** card, the operator's hold on the status strip. It has two modes. In *auto* it hands the strip back to `light_strip_bridge`, which follows `/mission/state` and paints the colour for each mission phase. In *manual* it calls `/lupin/leds/set` (`mirte_msgs/srv/SetNeopixel`) to pin a colour from the preset swatches, which mirror the bridge's auto palette so a manual pick reads the same as the state it stands for, and `/lupin/leds/auto` (`std_srvs/srv/Trigger`) hands control back. The one thing the card cannot override is safety, **E-stop and FAULT still force red on the robot regardless of a manual hold**, the bridge enforces that and the UI only reflects intent. On Mirte-247264 the strip is wired BRG, so the bridge carries a `color_order: 'BRG'` param to remap the bytes, the HMI palette shows true colours. See [Green shows red](/docs/war-stories).
+The Map tab also carries the **LightControl** card, the operator's hold on the status strip. It has two modes. In *auto* it hands the strip back to `light_strip_bridge`, which follows `/mission/state` and paints the colour for each mission phase. In *manual* it calls `/lupin/leds/set` (`mirte_msgs/srv/SetNeopixel`) to pin a colour from the preset swatches, which mirror the bridge's auto palette so a manual pick reads the same as the state it stands for, and `/lupin/leds/auto` (`std_srvs/srv/Trigger`) hands control back. The one thing the card cannot override is safety, **E-stop and FAULT still force red on the robot regardless of a manual hold**, the bridge enforces that and the UI only reflects intent. On Mirte-247264 the strip is wired BRG, so the bridge carries a `color_order: 'BRG'` param to remap the bytes, the HMI palette shows true colours. See [Green shows red](/docs/war-stories). The same two services back the voice `set_light` tool, so "make the lights blue" or "put the lights back to auto" drive the identical manual/auto path as the card.
 
 <Figure src="/hmi/hmi-light-control.png" caption="Map tab · LightControl card: auto-mode swatches following mission state, manual override, and the estop/FAULT red lock" />
 
@@ -241,7 +241,7 @@ The Voice tab opens a single bidirectional WebSocket from the browser **directly
 
 The deep mechanism here is **who decides a turn is over**. The HMI disables Gemini's server-side `automaticActivityDetection` and the client owns the turn boundaries, a browser `SpeechEndpointer` (`lib/voice/vad.ts`) fires `activityStart` when speech begins and `activityEnd` on an RMS-silence hold (or on push-to-talk release). The reason is latency, *double-gating* the turn, the client closing the mic on silence *and* the server waiting for its own silence timeout, added roughly `800 ms` and stranded responses until the next button press. With one authority over the boundary, the turn commits the instant the client says so. A companion fix is the **eager AudioContext resume**, the output player is created and resumed inside the user gesture that starts the session, so the first model chunk never hits a suspended-context hang.
 
-The model is given a **22-tool function-calling surface**, declared at session start in `web/src/lib/voice/tools.ts` (the `ROBOT_TOOL_DECLARATIONS` array and the `ToolName` union both carry 22 entries) and dispatched in `web/src/lib/voice/session.tsx` against the live ROS and E-stop providers. Grouped by domain:
+The model is given a **23-tool function-calling surface**, declared at session start in `web/src/lib/voice/tools.ts` (the `ROBOT_TOOL_DECLARATIONS` array and the `ToolName` union both carry 23 entries) and dispatched in `web/src/lib/voice/session.tsx` against the live ROS and E-stop providers. Grouped by domain:
 
 <Mermaid chart={`classDiagram
   class Drive {
@@ -275,9 +275,12 @@ The model is given a **22-tool function-calling surface**, declared at session s
     engage_estop()
     query_state() readonly
     speak() readonly
+  }
+  class StatusLight {
+    set_light()
   }`} />
 
-The surface splits into drive bursts, Nav2-mediated motion, arm presets and the pose/sequence library, the gripper, and safety/IO. Highlights of the dispatch:
+The surface splits into drive bursts, Nav2-mediated motion, arm presets and the pose/sequence library, the gripper, the status light, and safety/IO. Highlights of the dispatch:
 
 | Tool | Purpose |
 |------|---------|
@@ -299,6 +302,7 @@ The surface splits into drive bursts, Nav2-mediated motion, arm presets and the 
 | `query_state` | Read-only, fetch `pose`, `battery`, `estop`. Never moves the robot. |
 | `engage_estop` | Trigger the software E-stop (reason `voice-agent`), reset stays manual. |
 | `speak` | Push text into the transcript with no motion or audio. |
+| `set_light` | Pin the status strip to a named palette colour via `mirte_msgs/srv/SetNeopixel` (`/lupin/leds/set`), or `mode:'auto'` → `std_srvs/srv/Trigger` (`/lupin/leds/auto`). Cosmetic, **not** e-stop gated. |
 
 ### The voice dispatch safety envelope
 
