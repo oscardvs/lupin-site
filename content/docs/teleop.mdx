@@ -44,7 +44,7 @@ Up to four nodes publish `geometry_msgs/Twist` velocity commands; one arbiter fo
 
 ### Why the dead-man makes priority honest
 
-The Xbox dead-man is not a convenience, it is the reason the whole bus works. `teleop_twist_joy` is launched with `require_enable_button: true` and `enable_button: 6` (LB), so `/cmd_vel_joy` goes **completely silent** the instant LB is released. *Silent* means literally no publication, not a stream of zero-valued `Twist` messages. That distinction is the entire mechanism.
+The Xbox dead-man is not a convenience, it is the reason the whole bus works. `teleop_twist_joy` is launched with `require_enable_button: true` and `enable_button` set to LB (button 6 on Bluetooth, 4 on a USB cable — the index is transport-specific, see [Xbox control layout](#xbox-control-layout) below), so `/cmd_vel_joy` goes **completely silent** the instant LB is released. *Silent* means literally no publication, not a stream of zero-valued `Twist` messages. That distinction is the entire mechanism.
 
 Walk the counterfactual. Priority arbitration only demotes a source after its timeout *elapses with no message*. If teleop instead emitted an unbroken all-zero `Twist` stream, priority 100 would stay perpetually fresh, the 0.3 s timeout would never fire, and Nav2 and the web HMI would be starved of the bus forever. So the rule is strict: the highest-priority source must be able to fall silent, and only the dead-man gives it that ability.
 
@@ -64,7 +64,7 @@ Walk the counterfactual. Priority arbitration only demotes a source after its ti
 </Callout>
 
 <Callout type="info">
-  **Do not be confused by two stale code comments.** `twist_mux.yaml` line 14 and `sim_full.launch.py` say the dead-man is "LT" / `enable_button=2`. The *live* config is LB / `enable_button: 6`, which is what this doc states. LT cannot be the dead-man at all, `teleop_twist_joy`'s `enable_button` takes a *button index*, and on this pad the triggers are *axes* (4 and 5), not buttons. The comments are a code-comment bug, not a config bug.
+  **Do not be confused by two stale code comments.** `twist_mux.yaml` line 14 and `sim_full.launch.py` say the dead-man is "LT" / `enable_button=2`. The *live* config is LB (`enable_button: 6` on Bluetooth, `4` on USB — see [Xbox control layout](#xbox-control-layout)), which is what this doc states. LT cannot be the dead-man at all, `teleop_twist_joy`'s `enable_button` takes a *button index*, and on this pad the triggers are *axes* (4 and 5), not buttons. The comments are a code-comment bug, not a config bug.
 </Callout>
 
 ### The fourth source: the sim idle-stop guard
@@ -117,7 +117,29 @@ For a minimal joystick-only output (e.g. bench-testing a DS4 binding) with no mu
 
 ### Xbox control layout
 
-The mapping was probed live against an Xbox Wireless Controller (`045e:0b13`) in Bluetooth mode. Its BLE HID descriptor does **not** follow the SDL2 default Xbox layout (which would put LB at 4, RB at 5), so the indices below are specific to this pad and kernel. Re-probe with `ros2 topic echo /joy --field buttons` if you swap controllers.
+The index order a pad presents to `joy_node` (SDL2) is decided by the kernel driver, and the driver is decided by **how the pad is connected**. A USB cable binds `xpad` (the standard Xbox layout); Bluetooth binds the Microsoft-HID path, a *shifted* layout the SDL2 defaults don't describe (LB lands at button 6, not 4, and the face buttons skip index 2). Switching transports silently remaps every control — exactly the trap when the pad moves from Bluetooth to a USB-C cable.
+
+So the mapping lives in **two files**, and `xbox_teleop.launch.py` selects one at launch by reading the transport bus (`lupin_hmi/pad_detect.py`, parsing `/proc/bus/input/devices`: `Bus=0003` is USB, `Bus=0005` is Bluetooth):
+
+- `config/xbox_config.usb.yaml`
+- `config/xbox_config.bluetooth.yaml`
+
+Force a transport with `controller_mode:=usb|bluetooth`; with no pad detected it falls back to USB. Each file carries the full `joy_node` + `teleop_twist_joy_node` + `arm_teleop` parameter sections. The control *scheme* is identical on both transports — only the indices and axis signs differ:
+
+| Physical control | Function | Bluetooth | USB cable |
+| --- | --- | --- | --- |
+| LB | dead-man (hold to drive) | button 6 | button 4 |
+| RB | turbo | button 7 | button 5 |
+| Left stick | translate (`linear.x` fwd/back, `linear.y` strafe) | axes 1 / 0 | axes 1 / 0 |
+| Right stick X | `angular.yaw` (turn in place) | axis 2 | axis 3 |
+| B / X | shoulder pan +/- | buttons 1 / 3 | buttons 1 / 2 |
+| Y / A | shoulder lift +/- | buttons 4 / 0 | buttons 3 / 0 |
+| D-pad up-down / left-right | elbow / wrist +/- | axes 7 / 6 | axes 7 / 6 |
+| RT / LT | gripper open / close | axes 4 / 5 | set by calibrator |
+
+The USB triggers ship **seeded disabled** — the wired rest/full convention varies by kernel and a wrong guess could creep the jaw at rest, so the calibrator measures and enables them (see the trigger gotcha below). Re-probe a swapped pad **interactively** with `ros2 run lupin_hmi calibrate_xbox`: it detects the transport, spawns its own `joy_node` (teleop stays down, so nothing drives while you press buttons), walks each control one at a time — capturing the index **and direction** — and rewrites only the matching `xbox_config.<mode>.yaml`, backing up the old one and leaving the other transport's file alone. The raw `ros2 topic echo /joy --field buttons` peek still works for a quick look.
+
+The Bluetooth-mode scheme in full:
 
 ```text
 Drive (hold LB = button 6, the dead-man):
@@ -134,22 +156,22 @@ Arm (LB released, modes are mutually exclusive by construction):
     LT (axis 5)     -> gripper close
 ```
 
-<Figure src="/photos/xbox-control-map.png" caption="Annotated Xbox Wireless Controller (045e:0b13) showing the live BLE-mode mapping: LB=6 dead-man, RB=7 turbo, left stick translate, right-stick-X yaw, A0/B1/X3/Y4 shoulder, D-pad elbow/wrist, RT4/LT5 gripper. Indices are this pad's BLE HID layout, not SDL2 defaults." />
+<Figure src="/photos/xbox-control-map.png" caption="Annotated Xbox Wireless Controller (045e:0b13) showing the live BLE-mode mapping: LB=6 dead-man, RB=7 turbo, left stick translate, right-stick-X yaw, A0/B1/X3/Y4 shoulder, D-pad elbow/wrist, RT4/LT5 gripper. Indices are this pad's Bluetooth-mode HID layout; over a USB cable the launch auto-selects xbox_config.usb.yaml with the standard xpad layout (LB=4, RB=5, X=2, Y=3, right-stick-X=axis 3)." />
 
 Two de-confliction decisions are load-bearing:
 
 - **Shoulder pan/lift live on the face buttons, not the right stick.** The right stick used to be dual-use, chassis yaw with LB held and shoulder pan with LB released, and brushing it during an LB release flicked the arm. Face buttons are physically separate from any chassis input, so the two modes can never bleed into each other.
-- **The shoulder is also gated off whenever LB is held.** In `arm_teleop` the gate is `shoulder_live = enable_held and not disable_held`, with `shoulder_enable_button` defaulting to `-1` (always true) and `shoulder_disable_button: 6` (LB). The truth table is exactly the design intent:
+- **The shoulder is also gated off whenever LB is held.** In `arm_teleop` the gate is `shoulder_live = enable_held and not disable_held`, with `shoulder_enable_button` defaulting to `-1` (always true) and `shoulder_disable_button` = LB (6 on Bluetooth, 4 on USB; the calibrator keeps it equal to `enable_button`). The truth table is exactly the design intent:
 
 | LB state | chassis | shoulder pan/lift |
 | --- | --- | --- |
 | **held** | driving | silenced |
 | **released** | idle | live |
 
-`joy_node` runs with `deadzone: 0.15` and `autorepeat_rate: 20.0`. The 0.15 deadzone covers the Series X|S pad's resting BT-mode drift, the joy default of `0.05` was too tight and let stick drift times `scale_angular` spin the chassis in place while LB was held.
+`joy_node` runs with `autorepeat_rate: 20.0` and a per-transport `deadzone` (`0.15` on Bluetooth, `0.10` on USB). The 0.15 covers the Series X|S pad's resting BT-mode drift, the joy default of `0.05` was too tight and let stick drift times `scale_angular` spin the chassis in place while LB was held.
 
 <Callout type="warn">
-  `scale_linear`/`scale_angular` in `config/xbox_config.yaml` are **positive** (`0.2`/`0.2` linear, `0.7` yaw, turbo `0.6`/`0.6`/`1.4`). Mirte-247264's mecanum drive was originally wired with motor and encoder leads reversed in pairs, rotating the vendor `cmd_vel` frame 180 degrees about Z, and these scales used to be negative to compensate. That inversion was **fixed at the source** (telemetrix motor `p1`/`p2` plus encoder `A`/`B` pin-swap, 2026-06-01), so the `cmd_vel` frame now matches the physical chassis and the scales are plain positive, pushing the stick forward drives forward. The same file feeds sim via `xbox_teleop.launch.py`, which never had the flip. See the [war stories](/docs/war-stories) entry on the 180-degree base frame.
+  **`scale_linear`/`scale_angular` signs encode the stick's axis polarity, which flips between transports.** The Bluetooth file uses **positive** scales (`0.2/0.2` linear, `0.7` yaw; turbo `0.6/0.6/1.4`) because BT reports stick-forward as `+1`; the USB file uses the **negated** scales because `xpad` reports stick-forward as `-1`. Both yield the same physical result — push forward, drive forward — and the calibrator sets each sign from the direction you actually push. This is *separate* from the one-time base-frame fix: Mirte-247264's mecanum drive was once wired with motor and encoder leads reversed in pairs, rotating the vendor `cmd_vel` frame 180 degrees about Z, which was **fixed at the source** (telemetrix motor `p1`/`p2` plus encoder `A`/`B` pin-swap, 2026-06-01) so no software mirror is needed any more. The same files feed sim via `xbox_teleop.launch.py`, which never had the flip. See the [war stories](/docs/war-stories) entry on the 180-degree base frame.
 </Callout>
 
 ## Arm and gripper teleop
@@ -162,9 +184,9 @@ Two de-confliction decisions are load-bearing:
 - **On the idle to active edge it re-seeds** a joint from live `/joint_states`, so a tap is one clean step rather than a jump from a gravity-sagged setpoint.
 - **Every trajectory point carries a non-zero velocity** (`joint_velocity`, Xbox launch `2.0`) because the Hiwonder Telemetrix interface was reported to reject points with velocity `0.0`. That report is *asserted by the original teleop comment but not yet empirically confirmed* against the JTC-to-HW path (`arm_traj.py`), so the non-zero hint is kept as the conservative default, not as a proven requirement.
 
-Arm motion is published as `trajectory_msgs/JointTrajectory` to `/mirte_master_arm_controller/joint_trajectory`. The gripper is driven by the Xbox triggers (`open_axis: 4` RT, `close_axis: 5` LT), clamped to the URDF `gripper_joint` range `[-0.20, 0.25]` rad, and sent as `control_msgs/action/GripperCommand` goals to `/mirte_master_gripper_controller/gripper_cmd`.
+Arm motion is published as `trajectory_msgs/JointTrajectory` to `/mirte_master_arm_controller/joint_trajectory`. The gripper is driven by the Xbox triggers — `open_axis`/`close_axis` map to RT/LT (axes 4/5 on Bluetooth; on USB they are seeded disabled and set by the calibrator) — clamped to the URDF `gripper_joint` range `[-0.20, 0.25]` rad, and sent as `control_msgs/action/GripperCommand` goals to `/mirte_master_gripper_controller/gripper_cmd`.
 
-The trigger math has a gotcha worth pinning. `_trigger_pull` reads an Xbox trigger axis that **rests at +1 and goes to -1 at full pull**, mapping it to a pull magnitude `(1 - v) / 2` in `[0, 1]`. Crucially it returns `0` until the axis has produced a clearly-pulled value at least once, *ignoring the bogus `0.0` reading some joy drivers emit before the first physical event*. Without that `_trigger_init` guard an uninitialised `0.0` would read as a half-pull and creep the jaw on startup. The gripper is also held at NaN until `gripper_joint` first appears in `/joint_states`, so an early trigger pull can't snap a jaw that hasn't been seeded, mirroring the arm-seed gate.
+The trigger math has a gotcha worth pinning, and it is *why the triggers are calibrated per transport*. A Bluetooth trigger axis **rests at +1 and goes to -1 at full pull**, but a wired `xpad` trigger commonly does the opposite (rests at -1, pulls to +1) or rests near 0 — so a fixed formula would read a wired trigger as part-pulled at rest and creep the jaw. `_trigger_pull` therefore takes the axis's **rest and full values as parameters** (`gripper_open_rest`/`gripper_open_full` and the matching close pair, measured by the calibrator) and computes pull `= (v - rest) / (full - rest)` clamped to `[0, 1]`. It still returns `0` until the axis has produced a real frame, *ignoring the bogus `0.0` reading some joy drivers emit before the first physical event* — when rest sits near ±1 that `0.0` would otherwise read as a half-pull (the `_trigger_init` guard; with rest near 0 there is no ambiguity, so it initialises immediately). The gripper is also held at NaN until `gripper_joint` first appears in `/joint_states`, so an early trigger pull can't snap a jaw that hasn't been seeded, mirroring the arm-seed gate.
 
 <Callout type="warn">
   **The gripper direction is inverted on this jaw.** On Mirte-247264, HMI **-30 degrees = OPEN** and **+30 degrees = CLOSED** (`arm_limits.py`), the opposite of intuition. Any semantic open/close consumer must use open maps to -30, close maps to +30. The window itself is also **conservative and unverified**, `GRIPPER_RANGE_UNVERIFIED = True`, the servo actually reaches `-43.6 .. +37` degrees, so the documented plus-or-minus 30 window is a guess pending a live `GetServoRange` tuning pass, not a final spec.
@@ -347,6 +369,10 @@ This is the single most operationally important teleop failure mode, and it is *
   STABLE --> EV["event1 + js0"]
   EV --> JOY["/joy ~20-100 Hz, wheels turn"]
 `} />
+
+<Callout type="info">
+  **A USB-C cable sidesteps the BLE trap entirely.** Wired, the pad binds `xpad` with no pairing, no interval pin, and no `/dev/input/event*` race — `joy_node` just opens it, and `xbox_teleop.launch.py` auto-detects the wired layout and loads `xbox_config.usb.yaml`. If BLE is reconnect-looping on the day, the cable is the fastest recovery; the only cost is the tether. Calibrate once per transport (`ros2 run lupin_hmi calibrate_xbox`) and both mappings are saved, so swapping cable for Bluetooth later needs no re-probe.
+</Callout>
 
 ## Sim-only adapters
 
