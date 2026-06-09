@@ -24,7 +24,7 @@ import { Atmosphere, ReticleCorners } from './atmosphere';
 import { Reveal } from './reveal';
 import { BringupTerminal } from './terminal';
 import { DemoFrame } from './demo';
-import { FacilityPhoto } from './facility-photo';
+import { Photo } from './photo';
 
 /* ---------------------------------------------------------------- shared */
 
@@ -184,6 +184,15 @@ export function Problem() {
         <p className="mt-6 inline-block border-t border-chartreuse/40 pt-3 font-display text-xl text-chartreuse">
           Let the robot walk the rows.
         </p>
+      </Reveal>
+
+      <Reveal delay={120} className="mx-auto mt-12 max-w-4xl">
+        <Photo
+          src="/greenhouse/tulip-rows.jpeg"
+          alt="Rows of tulips under glass at the Tulpen.nl greenhouse, stretching to the horizon"
+          caption="Tulpen.nl · thousands of plants, every aisle"
+          aspect="aspect-[16/9]"
+        />
       </Reveal>
     </Section>
   );
@@ -460,21 +469,38 @@ export function Hardware() {
 
         <Reveal delay={100}>
           <div className="grid grid-cols-2 gap-3">
-            {HW.map((h) => (
-              <div
-                key={h.t}
-                className="reticle flex flex-col gap-2 rounded-[5px] border border-hairline bg-fd-card/50 p-4"
-              >
-                <h.Icon className="h-5 w-5 text-chartreuse" />
-                <div>
-                  <p className="text-sm font-medium leading-tight text-fd-foreground">{h.t}</p>
-                  <p className="tag mt-1">{h.s}</p>
-                </div>
-              </div>
-            ))}
+            <Photo
+              src="/robot/front.jpeg"
+              alt="Lupin robot, front view: the 4-DOF arm raised with a flower in the gripper above its white 3D-printed crate"
+              caption="Front · arm + crate"
+              aspect="aspect-[3/4]"
+            />
+            <Photo
+              src="/robot/back.jpeg"
+              alt="Lupin robot, rear view: the mecanum drive base and the flower payload riding in the crate"
+              caption="Rear · mecanum base"
+              aspect="aspect-[3/4]"
+            />
           </div>
         </Reveal>
       </div>
+
+      <Reveal delay={150} className="mt-10">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+          {HW.map((h) => (
+            <div
+              key={h.t}
+              className="reticle flex flex-col gap-2 rounded-[5px] border border-hairline bg-fd-card/50 p-4"
+            >
+              <h.Icon className="h-5 w-5 text-chartreuse" />
+              <div>
+                <p className="text-sm font-medium leading-tight text-fd-foreground">{h.t}</p>
+                <p className="tag mt-1">{h.s}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      </Reveal>
     </Section>
   );
 }
@@ -586,11 +612,13 @@ export function Team() {
         </div>
       </Reveal>
 
-      <Reveal className="mt-6">
-        <FacilityPhoto
-          src="/team/tulpen-visit.jpg"
-          alt="Team Lupin visiting the Tulpen.nl growing facility"
+      <Reveal className="mt-8">
+        <Photo
+          src="/team/tulpen-visit.jpeg"
+          alt="Team Lupin at the Tulpen.nl growing facility, with a grower holding a bunch of yellow tulips"
           caption="Field study · Tulpen.nl growing facility visit"
+          aspect="aspect-[4/5]"
+          className="mx-auto max-w-md"
         />
       </Reveal>
 
