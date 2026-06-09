@@ -164,39 +164,42 @@ A *blocking* timeout would deadlock the single-threaded executor that also fills
 
 ### Known-layout bloom placement (Stream B)
 
-This is the cleverest idea in the stack, and it used to be invisible. The greenhouse layout is **known**: the course `tag_locations.json` (the same file that seeds the sim world and the mission's approach poses) gives every planter bench as an exact rectangle, the `tables` dict, in metres, the real benches are `1.10 x 0.25` m. So a bloom's map position is fully determined *without depth*, register that known layout onto the live map, then place the bloom inside the real rectangle. `box_geometry.py` owns that math as a pure, ROS-free, unit-tested module (it mirrors how `lupin_mission/approach.py` isolates the approach-pose geometry).
+This is the cleverest idea in the stack, and it used to be invisible. The greenhouse layout is **known**: the course `tag_locations.json` (the same file that seeds the sim world and the mission's approach poses) gives every planter bench as an exact rectangle, the `tables` dict, in metres, the real benches are `1.10 x 0.25` m. So a bloom's map position is fully determined *without depth*, register that known layout onto the live map, then place the bloom inside the real rectangle.
 
-Two steps turn the tag detections into a map-frame box:
+The geometry is split **producer / consumer** so the aggregator stays a pure fuser. A small **`box_layout_publisher`** node is the producer; the aggregator consumes its boxes off `/perception/box_geometry_json` (a `MapBox` per tag: centre, outward-normal yaw, width, depth) and only falls back to a tag-anchored box when none arrive. Both sides live in `box_geometry.py`, a pure, ROS-free, unit-tested module (it mirrors how `lupin_mission/approach.py` isolates the approach-pose geometry); an OpenCV/occupancy node could publish the same contract.
+
+The producer turns the tag detections into map-frame boxes in two steps:
 
 - **Register the layout.** The detected tags form a constellation whose map positions should match their `tag_locations.json` coordinates up to a rigid motion. `solve_rigid_2d` fits that motion, a closed-form 2-D Kabsch (rotation + translation, no scale) over every discovered tag's `(json_xy, map_xy)` pair. Orientation comes from the **whole constellation of tag positions**, far more stable than any single tag's quaternion. Where the map is already aligned to the layout (the sim case) the fit is the identity; on hardware the boxes snap into the registered orientation once a second tag is seen.
-- **Place the rectangle.** For each tag, `nearest_table_rect` picks its bench, the four corners are transformed into the map frame, and `box_geometry_from_corners` builds the box frame: the bench's **long edge is the lateral axis `l`**, its **short edge the depth/normal `n`** (signed toward the tag so the box *front* faces the aisle), with the origin at the centre of that front edge. A bloom at lateral fraction `f in [-1, 1]` and depth fraction `d in [0, 1]` maps to `origin + l*(f*width/2) - n*(d*depth)`, exactly the placement the rest of Stream B already used. Drawing the *full* rectangle is also what "fills in" the cells the lidar can't see behind the near face.
+- **Emit the rectangle.** For each tag, `nearest_table_rect` picks its bench, the four corners are transformed into the map frame, and `map_box_from_rect` packs them into a `MapBox`: long edge → width (lateral `l`), short edge → depth (normal `n`), yaw signed toward the tag so the box *front* faces the aisle. The aggregator's `box_from_map_box` reconstructs the frame, and a bloom at lateral fraction `f in [-1, 1]`, depth `d in [0, 1]` maps to `origin + l*(f*width/2) - n*(d*depth)`. Drawing the *full* rectangle is also what "fills in" the cells the lidar can't see behind the near face.
 
-When the layout can't be resolved (package missing, or a tag with no table) the node **falls back** to the legacy box: a fixed `StandardBox` (fallback `width=0.80`, `depth=0.40`) hung off the single tag pose, with the in-plane normal `n` taken from the tag quaternion, `nx = 2(qx*qz + qw*qy)`, `ny = 2(qy*qz - qw*qx)`. That legacy path produced the old, wrong-sized overlay (a `0.80 x 0.40` box per *tag*, so ~4 overlapping rects per bench); it now runs only when the real rectangle is unavailable.
+When no box arrives for a tag (producer down, package missing, or a tag with no table) the aggregator **falls back** to the legacy box: a fixed `StandardBox` (fallback `width=0.80`, `depth=0.40`) hung off the single tag pose via `box_from_tag`, with the in-plane normal `n` from the tag quaternion, `nx = 2(qx*qz + qw*qy)`, `ny = 2(qy*qz - qw*qx)`. That legacy path is the old, wrong-sized overlay (a `0.80 x 0.40` box per *tag*, so ~4 overlapping rects per bench); the producer is what makes the real rectangle the normal case.
 
 Each YOLO detection's lateral fraction comes from fusing two cues: the **arm pan angle** (coarse, and the primary cue once the Stream-C sweep lands) and the **detection's image-x** (fine). `box_geometry.lateral_fraction` computes `bearing = (pan - pan_center) + bbox_cx_norm * camera_half_fov`, then scales it by `pan_half_span + camera_half_fov` and clamps to `[-1, 1]`. Pre-Stream-C, with a static pan, image-x alone drives placement, and `detection_image_width=640` is only a *spread-tuning* constant used to normalise bbox centre-x to `[-1, 1]`, the real camera may differ, but getting it wrong shifts spread magnitude, not correctness.
 
 `bin_detections` then groups the per-scan detections into `lateral_columns` (default **7**) across the box, picks the dominant non-anomaly species per occupied column, raises `anomaly` if the `bug` class lands anywhere in that column, and scatters depth with a **deterministic golden-ratio jitter** (RNG-free, so the same scan always renders the same bed) before calling `geom.place(f, d)`. The output is a `FlowerPoint[]` of map positions plus a 4-corner `box_footprint` polygon.
 
 <Mermaid chart={`graph TD
-  TAGS["discovered tags<br/>map poses"] --> REG["solve_rigid_2d<br/>JSON to map (Kabsch)"]
-  JSON["tag_locations.json<br/>table rectangles"] --> REG
-  JSON --> NT["nearest_table_rect"]
-  REG --> XF["transform corners<br/>to map frame"]
-  NT --> XF
-  XF --> FRAME["box frame<br/>long=lateral, short=normal"]
+  JSON["tag_locations.json<br/>table rectangles"] --> NT["nearest_table_rect"]
+  JSON --> REG["solve_rigid_2d<br/>JSON to map (Kabsch)"]
+  TAGS["discovered tags<br/>map poses"] --> REG
+  REG --> MB["map_box_from_rect"]
+  NT --> MB
+  MB --> TOPIC["/perception/box_geometry_json<br/>MapBox per tag"]
+  TOPIC --> BFM["box_from_map_box<br/>box frame"]
   YD["YOLO detection"] --> CXN["bbox centre-x<br/>normalized [-1,1]"]
   PAN["arm shoulder_pan"] --> LF["lateral_fraction f"]
   CXN --> LF
   LF --> BIN["bin_detections<br/>7 lateral columns"]
-  FRAME --> PLACE["geom.place(f, d)"]
+  BFM --> PLACE["geom.place(f, d)"]
   BIN --> PLACE
   PLACE --> OUT["FlowerPoint[] + box_footprint"]
-  XF -->|"no layout / no table"| FALL["legacy StandardBox<br/>off tag quaternion"]
-  FALL --> FRAME
+  TAGS -->|"no box for tag"| FALL["legacy box_from_tag<br/>off tag quaternion"]
+  FALL --> PLACE
 `} />
 
 <Callout type="info">
-  **Degenerate-normal fallback (legacy path).** Only on the legacy `StandardBox` fallback: if the tag normal is also degenerate, the tag faces straight up or down, or its orientation is too noisy, `box_from_tag` returns `None` and `bin_detections` returns `[]`. `_emit_flower_observation` then places a single bloom **at the tag pose**, so a classified or pest-flagged tag still shows one dot. This fixed a real bug where a `bug`-only degenerate tag emitted no point at all. With the known-layout rectangle resolved (the normal path) this case no longer arises.
+  **Degenerate-normal fallback (legacy path).** Only on the legacy `StandardBox` fallback: if the tag normal is also degenerate, the tag faces straight up or down, or its orientation is too noisy, `box_from_tag` returns `None` and `bin_detections` returns `[]`. `_emit_flower_observation` then places a single bloom **at the tag pose**, so a classified or pest-flagged tag still shows one dot. This fixed a real bug where a `bug`-only degenerate tag emitted no point at all. With `box_layout_publisher` supplying the real rectangle (the normal case) this no longer arises.
 </Callout>
 
 <Figure src="/screenshots/hmi-map-flower-dots-in-box.png" caption="HMI MapView: a diamond tag pin with species-coloured flower dots scattered inside the box rectangle, instead of every flower stacked on the tag. The visible payoff of the Stream-B box_footprint + FlowerPoint[] pipeline." />
