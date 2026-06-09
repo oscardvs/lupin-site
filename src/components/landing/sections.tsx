@@ -118,6 +118,7 @@ export function Hero() {
             label="01 · live mission"
             mode="ambient"
             aspect="16/9"
+            src="/demos/hero.mp4"
             dropPath="/demos/hero.mp4"
             className="glow-primary"
           />
