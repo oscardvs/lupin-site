@@ -1,11 +1,11 @@
 ---
 title: Perception
-description: AprilTag detection with OpenCV ArUco and live-CameraInfo solvePnP, a YOLO gripper-cam flower grader with an HSV sim stand-in, and an aggregator that TF-projects tags into map, debounces a discovered-tag registry, and tag-anchors each bloom into a planter box for the mission, twin, and HMI.
+description: AprilTag detection with OpenCV ArUco and live-CameraInfo solvePnP, a YOLO gripper-cam flower grader with an HSV sim stand-in, and an aggregator that TF-projects tags into map, debounces a discovered-tag registry, and places each bloom into the greenhouse's real planter rectangle for the mission, twin, and HMI.
 ---
 
-Lupin's perception stack reads the greenhouse two ways: it locates **AprilTag climate stations** from the Orbbec RGB stream, and it **classifies tulips and pest anomalies** from the gripper camera. An aggregator then fuses both into one map-localised, debounced **registry** that the [mission orchestrator](/docs/mission) and the [digital twin](/docs/digital-twin) consume, and it places every detected bloom into the planter box around each tag instead of stacking dots on the marker.
+Lupin's perception stack reads the greenhouse two ways: it locates **AprilTag climate stations** from the Orbbec RGB stream, and it **classifies tulips and pest anomalies** from the gripper camera. An aggregator then fuses both into one map-localised, debounced **registry** that the [mission orchestrator](/docs/mission) and the [digital twin](/docs/digital-twin) consume, and it places every detected bloom into the **real** planter rectangle (from the known greenhouse layout) instead of stacking dots on the marker.
 
-This page is the reference for that fusion: the two detectors, the sim-versus-hardware swap point, the tag-anchored box geometry that turns a 4 cm marker into a bed of located flowers, and the temporal-co-location rule that stands in for a shared 3-D frame Lupin does not have.
+This page is the reference for that fusion: the two detectors, the sim-versus-hardware swap point, the known-layout box geometry that registers the greenhouse's real planter rectangles onto the live map and turns a 4 cm marker into a bed of located flowers, and the temporal-co-location rule that stands in for a shared 3-D frame Lupin does not have.
 
 **Four** console scripts ship in `lupin_perception` (`setup.py`), not three:
 
@@ -162,23 +162,28 @@ A *blocking* timeout would deadlock the single-threaded executor that also fills
   **Symptom.** Tags are clearly in view but `/perception/discovered_tags` stays empty, exploration never reaches its goal, and the only error you eventually get is an opaque `exploration_timeout`. **Cause.** Tags are detected but **none** are map-localisable, missing camera intrinsics or a missing `map -> camera` TF, so nothing is ever pose-committed. **Fix.** The aggregator detects this exact state (a frame with detections but zero localised) and emits a throttled warning naming `camera_info`/intrinsics and the `map -> camera` TF, so the real cause surfaces instead of a downstream timeout.
 </Callout>
 
-### Tag-anchored bloom placement (Stream B)
+### Known-layout bloom placement (Stream B)
 
-This is the cleverest idea in the stack, and it used to be invisible. A single 4 cm tag plus a **known box size** fully determines every bloom's map position *without depth*, because the box is a rigid transform of the tag pose. `box_geometry.py` owns that math as a pure, ROS-free, unit-tested module (it mirrors how `lupin_mission/approach.py` isolates the approach-pose geometry).
+This is the cleverest idea in the stack, and it used to be invisible. The greenhouse layout is **known**: the course `tag_locations.json` (the same file that seeds the sim world and the mission's approach poses) gives every planter bench as an exact rectangle, the `tables` dict, in metres, the real benches are `1.10 x 0.25` m. So a bloom's map position is fully determined *without depth*, register that known layout onto the live map, then place the bloom inside the real rectangle. `box_geometry.py` owns that math as a pure, ROS-free, unit-tested module (it mirrors how `lupin_mission/approach.py` isolates the approach-pose geometry).
 
-The frame is built from the tag's map pose:
+Two steps turn the tag detections into a map-frame box:
 
-- **normal `n`**, the tag's local +Z axis projected onto the map XY plane, `nx = 2(qx*qz + qw*qy)`, `ny = 2(qy*qz - qw*qx)`, the *same* derivation the approach-pose code uses. It points out of the bed into the aisle, toward the camera that read the tag.
-- **lateral `l`**, `n` rotated +90 degrees in XY, i.e. `(-n_y, n_x)`, the across-the-bed axis.
-- **interior**, extends *opposite* `n` (into the bed) by `depth` and spans `+/- width/2` along `l`, with an optional `tag_lateral_offset`. A bloom at lateral fraction `f in [-1, 1]` and depth fraction `d in [0, 1]` maps to `origin + l*(f*width/2) - n*(d*depth)`. The `StandardBox` defaults are `width=0.80`, `depth=0.40`.
+- **Register the layout.** The detected tags form a constellation whose map positions should match their `tag_locations.json` coordinates up to a rigid motion. `solve_rigid_2d` fits that motion, a closed-form 2-D Kabsch (rotation + translation, no scale) over every discovered tag's `(json_xy, map_xy)` pair. Orientation comes from the **whole constellation of tag positions**, far more stable than any single tag's quaternion. Where the map is already aligned to the layout (the sim case) the fit is the identity; on hardware the boxes snap into the registered orientation once a second tag is seen.
+- **Place the rectangle.** For each tag, `nearest_table_rect` picks its bench, the four corners are transformed into the map frame, and `box_geometry_from_corners` builds the box frame: the bench's **long edge is the lateral axis `l`**, its **short edge the depth/normal `n`** (signed toward the tag so the box *front* faces the aisle), with the origin at the centre of that front edge. A bloom at lateral fraction `f in [-1, 1]` and depth fraction `d in [0, 1]` maps to `origin + l*(f*width/2) - n*(d*depth)`, exactly the placement the rest of Stream B already used. Drawing the *full* rectangle is also what "fills in" the cells the lidar can't see behind the near face.
+
+When the layout can't be resolved (package missing, or a tag with no table) the node **falls back** to the legacy box: a fixed `StandardBox` (fallback `width=0.80`, `depth=0.40`) hung off the single tag pose, with the in-plane normal `n` taken from the tag quaternion, `nx = 2(qx*qz + qw*qy)`, `ny = 2(qy*qz - qw*qx)`. That legacy path produced the old, wrong-sized overlay (a `0.80 x 0.40` box per *tag*, so ~4 overlapping rects per bench); it now runs only when the real rectangle is unavailable.
 
 Each YOLO detection's lateral fraction comes from fusing two cues: the **arm pan angle** (coarse, and the primary cue once the Stream-C sweep lands) and the **detection's image-x** (fine). `box_geometry.lateral_fraction` computes `bearing = (pan - pan_center) + bbox_cx_norm * camera_half_fov`, then scales it by `pan_half_span + camera_half_fov` and clamps to `[-1, 1]`. Pre-Stream-C, with a static pan, image-x alone drives placement, and `detection_image_width=640` is only a *spread-tuning* constant used to normalise bbox centre-x to `[-1, 1]`, the real camera may differ, but getting it wrong shifts spread magnitude, not correctness.
 
 `bin_detections` then groups the per-scan detections into `lateral_columns` (default **7**) across the box, picks the dominant non-anomaly species per occupied column, raises `anomaly` if the `bug` class lands anywhere in that column, and scatters depth with a **deterministic golden-ratio jitter** (RNG-free, so the same scan always renders the same bed) before calling `geom.place(f, d)`. The output is a `FlowerPoint[]` of map positions plus a 4-corner `box_footprint` polygon.
 
 <Mermaid chart={`graph TD
-  POSE["tag pose in map"] --> NORM["tag_normal_xy<br/>+Z projected to XY"]
-  NORM --> FRAME["box frame<br/>origin, normal, lateral"]
+  TAGS["discovered tags<br/>map poses"] --> REG["solve_rigid_2d<br/>JSON to map (Kabsch)"]
+  JSON["tag_locations.json<br/>table rectangles"] --> REG
+  JSON --> NT["nearest_table_rect"]
+  REG --> XF["transform corners<br/>to map frame"]
+  NT --> XF
+  XF --> FRAME["box frame<br/>long=lateral, short=normal"]
   YD["YOLO detection"] --> CXN["bbox centre-x<br/>normalized [-1,1]"]
   PAN["arm shoulder_pan"] --> LF["lateral_fraction f"]
   CXN --> LF
@@ -186,12 +191,12 @@ Each YOLO detection's lateral fraction comes from fusing two cues: the **arm pan
   FRAME --> PLACE["geom.place(f, d)"]
   BIN --> PLACE
   PLACE --> OUT["FlowerPoint[] + box_footprint"]
-  NORM -->|"degenerate normal"| FALL["single dot on tag pose"]
-  FALL --> OUT
+  XF -->|"no layout / no table"| FALL["legacy StandardBox<br/>off tag quaternion"]
+  FALL --> FRAME
 `} />
 
 <Callout type="info">
-  **Degenerate-normal fallback.** When the tag faces straight up or down, or its orientation is too noisy to derive an in-plane normal, `box_from_tag` returns `None` and `bin_detections` returns `[]`. In that case `_emit_flower_observation` falls back to a single bloom **at the tag pose**, so a classified or pest-flagged tag still shows one dot. This fixed a real bug where a `bug`-only degenerate tag emitted no point at all.
+  **Degenerate-normal fallback (legacy path).** Only on the legacy `StandardBox` fallback: if the tag normal is also degenerate, the tag faces straight up or down, or its orientation is too noisy, `box_from_tag` returns `None` and `bin_detections` returns `[]`. `_emit_flower_observation` then places a single bloom **at the tag pose**, so a classified or pest-flagged tag still shows one dot. This fixed a real bug where a `bug`-only degenerate tag emitted no point at all. With the known-layout rectangle resolved (the normal path) this case no longer arises.
 </Callout>
 
 <Figure src="/screenshots/hmi-map-flower-dots-in-box.png" caption="HMI MapView: a diamond tag pin with species-coloured flower dots scattered inside the box rectangle, instead of every flower stacked on the tag. The visible payoff of the Stream-B box_footprint + FlowerPoint[] pipeline." />

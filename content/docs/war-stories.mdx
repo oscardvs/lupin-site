@@ -173,6 +173,20 @@ The "raw terminal pub fails too" detail is what makes this so vicious. Bypassing
   **Lesson.** A safety-by-default zero-heartbeat through `twist_mux` means an open HMI can silently out-vote *every* other drive path, including raw terminal commands. Test the motor layer with priority-100 `/cmd_vel_joy` before you ever suspect the browser. See [Teleop](/docs/teleop) for the `twist_mux` priority table.
 </Callout>
 
+## The planter boxes drawn from a guess
+
+**Symptom.** On the HMI nav map (`PNL-NAV-01`), the planter-box overlay was visibly wrong, boxes the wrong size and aspect, rotated oddly, overlapping one another, and not lining up with the lidar obstacles on the SLAM map underneath.
+
+The tempting read is "the renderer is broken." It is not, `MapCanvas.tsx` faithfully draws the polygon it is handed. The lie was upstream, in what perception chose to hand it.
+
+**Cause.** `perception_aggregator` *synthesized* each box, `box_from_tag(tag_pose, StandardBox(0.80 x 0.40))`, a hardcoded size hung off the detected tag pose and rotated by the **tag's own quaternion** in-plane normal, the noisiest thing a 4 cm marker produces. And it drew one box **per tag**, so a bench carrying ~4 climate tags got ~4 overlapping oversized rectangles. Meanwhile the **exact** rectangles, `1.10 x 0.25` m benches, sat in the course `tag_locations.json` that the mission stack *already loads* for its approach poses. Perception was inventing geometry it could have read.
+
+**Fix.** Drive the box from the known layout instead. `solve_rigid_2d` registers the `tag_locations.json` rectangles onto the live map with a closed-form 2-D Kabsch fit over the whole detected-tag constellation, robust orientation from many tag positions rather than one quaternion, and the real bench rectangle is transformed in and drawn whole (which also fills the cells the lidar never sees behind the near face). The twin and HMI contracts did not change; only the numbers got correct. The synthesized box survives only as a fallback for when the layout cannot be resolved.
+
+<Callout type="info">
+  **Lesson.** When an overlay looks wrong, ask whether the renderer is drawing *measured* truth or a *synthesized guess*, the bug is usually in the guess, not the pixels. Here the ground truth was already on disk and already loaded; the fix was to read and register it, not to nudge the render. See [Perception](/docs/perception) for the known-layout box geometry.
+</Callout>
+
 ## The pattern behind the scars
 
 Read together, these sagas rhyme. Five of them, the wheels, the WiFi roam, the multi-homing, the clock-sync service, the rosbridge wedge in the [operations runbook](/docs/operations), share one shape: a layer reports **healthy** while the layer below it is dead, and the green light is a lie about something it cannot actually see. The fixes that stuck all moved the truth *down* a level, feel the wheels, read `No route to host`, check the advertised locator, watch the per-joint current. The fixes that failed all tried to compensate *up* a level, the HMI sign flip, the "safer" boot gate, the soft restart.
