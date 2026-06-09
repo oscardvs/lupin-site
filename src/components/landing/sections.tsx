@@ -579,7 +579,7 @@ const TEAM: {
   { name: 'Koen Vogels', initials: 'KV', role: 'Perception · control interface', handle: 'kvogels', photo: '/team/koen.jpeg', github: 'KoenVogels' },
   { name: 'Lapo Veca', initials: 'LV', role: 'Navigation · manipulation', handle: 'lapoveca' },
   { name: 'Lievijn Simons', initials: 'LS', role: 'Hardware integration · logic', handle: 'lwmssimons', photo: '/team/lievijn.jpeg' },
-  { name: 'Oscar Devos', initials: 'OD', role: 'Navigation · manipulation', handle: 'odevos', photo: '/team/oscar.jpeg' },
+  { name: 'Oscar Devos', initials: 'OD', role: 'Navigation · manipulation', handle: 'odevos', photo: '/team/oscar.jpeg', github: 'oscardvs' },
   { name: 'Tejas Stanley', initials: 'TS', role: 'Perception', handle: 'tstanley', photo: '/team/tejas.jpeg', github: 'tejasstanley' },
   { name: 'Tibbe Wouters', initials: 'TW', role: 'Task logic · control interface', handle: 'twouters' },
 ];
