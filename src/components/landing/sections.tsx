@@ -566,11 +566,17 @@ export function Highlights() {
 const GITLAB = 'https://gitlab.tudelft.nl';
 const GITLAB_GROUP = `${GITLAB}/cor/ro47007/2026/group_14`;
 
-const TEAM = [
-  { name: 'Koen Vogels', initials: 'KV', role: 'Perception · control interface', handle: 'kvogels' },
+const TEAM: {
+  name: string;
+  initials: string;
+  role: string;
+  handle: string;
+  photo?: string;
+}[] = [
+  { name: 'Koen Vogels', initials: 'KV', role: 'Perception · control interface', handle: 'kvogels', photo: '/team/koen.jpeg' },
   { name: 'Lapo Veca', initials: 'LV', role: 'Navigation · manipulation', handle: 'lapoveca' },
-  { name: 'Lievijn Simons', initials: 'LS', role: 'Hardware integration · logic', handle: 'lwmssimons' },
-  { name: 'Oscar Devos', initials: 'OD', role: 'Navigation · manipulation', handle: 'odevos' },
+  { name: 'Lievijn Simons', initials: 'LS', role: 'Hardware integration · logic', handle: 'lwmssimons', photo: '/team/lievijn.jpeg' },
+  { name: 'Oscar Devos', initials: 'OD', role: 'Navigation · manipulation', handle: 'odevos', photo: '/team/oscar.jpeg' },
   { name: 'Tejas Stanley', initials: 'TS', role: 'Perception', handle: 'tstanley' },
   { name: 'Tibbe Wouters', initials: 'TW', role: 'Task logic · control interface', handle: 'twouters' },
 ];
@@ -602,9 +608,19 @@ export function Team() {
               className="reticle group flex flex-col items-center gap-2 rounded-[5px] border border-hairline bg-fd-card/50 px-3 py-6 text-center transition-colors hover:border-chartreuse/40"
             >
               <ReticleCorners />
-              <span className="grid h-14 w-14 place-items-center rounded-full border border-chartreuse/40 bg-chartreuse/10 font-display text-xl text-chartreuse">
-                {m.initials}
-              </span>
+              {m.photo ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={m.photo}
+                  alt={m.name}
+                  loading="lazy"
+                  className="h-14 w-14 rounded-full border border-chartreuse/40 object-cover object-[center_30%] grayscale transition-[filter] duration-300 group-hover:grayscale-0"
+                />
+              ) : (
+                <span className="grid h-14 w-14 place-items-center rounded-full border border-chartreuse/40 bg-chartreuse/10 font-display text-xl text-chartreuse">
+                  {m.initials}
+                </span>
+              )}
               <span className="text-sm font-semibold leading-tight text-fd-foreground">{m.name}</span>
               <span className="tag leading-tight">{m.role}</span>
               <span className="tag tag-accent">@{m.handle}</span>
