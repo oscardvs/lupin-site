@@ -369,7 +369,29 @@ flowchart TD
   H --> I["controllers re-activate clean"]
 `} />
 
-`post-boot-sync.sh` encodes the safe procedure: it only steps the clock when the drift exceeds 3 s, and only with the stack **stopped**, then wipes SHM, then restarts. Re-running it mid-session as a health check is a no-op on the clock.
+### The chrony fix (now live)
+
+The proper fix, deployed and verified on Mirte-247264 on **2026-06-08**, stops *stepping* the clock mid-session at all. `install-clock-sync.sh` puts a `lupin-clock-sync` **oneshot** on the robot, ordered `Before=mirte-ros.service`, that disciplines the robot to the laptop's chrony with a single `chronyc makestep` **before `ros2_control` ever starts**, so the one big correction lands on a clock nothing is watching yet, and for the rest of the session chrony only *slews*. It also comments out Ubuntu's stock `makestep 1 3`, which would otherwise let chrony step a *live* stack the first time it reaches a far-off source (the [war story](/docs/war-stories) behind this).
+
+<Mermaid chart={`
+flowchart TD
+  A["boot: dead-RTC clock, far off"] --> B["lupin-clock-sync oneshot<br/>Before=mirte-ros"]
+  B --> C["chronyc makestep ONCE<br/>(no stack running yet)"]
+  C --> D["mirte-ros / ros2_control start<br/>on a correct clock"]
+  D --> E["chrony SLEWS only<br/>stock makestep disabled"]
+`} />
+
+The catch is that the robot syncs *from the laptop*, so the laptop has to actually **serve** NTP, and `chrony` being installed is not the same as serving. On the wired LAN that is a one-line drop-in on the laptop:
+
+```bash
+# laptop: serve UTC to the robot LAN (chrony installed != serving)
+printf 'allow 10.42.0.0/24\nlocal stratum 10\n' | sudo tee /etc/chrony/conf.d/lupin-server.conf
+sudo systemctl restart chrony && ss -lnup | grep ':123'   # expect chronyd on 0.0.0.0:123
+```
+
+`allow` admits the robot; `local stratum 10` makes the laptop serve its own clock even with no upstream, so AP mode (no internet) still works. After a reboot the robot's `chronyc tracking` shows `Reference ID … (10.42.0.2)` at stratum 4 and drift collapses to microseconds. The robot-side install and the operator runbook are in `DEMO_DAY_WIRED.md` (§A.4 robot, §B7 laptop).
+
+When the laptop NTP *isn't* reachable at boot (laptop joined late, or the server drop-in was never added), the robot still comes up skewed, and `post-boot-sync.sh` is the **fallback** that corrects it. It encodes the safe procedure: it only steps the clock when the drift exceeds 3 s, and only with the stack **stopped**, then wipes SHM, then restarts. Re-running it mid-session as a health check is a no-op on the clock.
 
 <Steps>
 <Step>
@@ -390,10 +412,17 @@ flowchart TD
 </Steps>
 
 <Callout type="error">
-  **Do not run `date -s` on a live stack.** It wedges `controller_manager` by leaving stale FastDDS SHM that a plain `systemctl restart` cannot clear; the cure is the reboot-free SHM wipe (stop → `rm /dev/shm/fastrtps_*` → start with the clock already stable), **not** a power-cycle. A power-cycle is *worse* here, the dead RTC re-creates the wrong-clock-then-step sequence and re-wedges. The proper long-term fix is a chrony stratum-10 drop-in so the robot disciplines to the laptop's clock instead of stepping it; it is designed but not yet installed on Mirte-247264, so `post-boot-sync.sh`'s guarded `date -s` is still the canonical path. Verify before referencing it as live.
+  **Do not run `date -s` on a live stack.** It wedges `controller_manager` by leaving stale FastDDS SHM that a plain `systemctl restart` cannot clear; the cure is the reboot-free SHM wipe (stop → `rm /dev/shm/fastrtps_*` → start with the clock already stable), **not** a power-cycle. A power-cycle is *worse* here, the dead RTC re-creates the wrong-clock-then-step sequence and re-wedges. The chrony stratum-10 setup above is **now the canonical path** (deployed 2026-06-08): the robot disciplines to the laptop's clock and steps only once, *before* `ros2_control` starts, so `date -s` on a live stack should never be needed. `post-boot-sync.sh`'s guarded step is the fallback for a boot where the laptop wasn't serving NTP.
 </Callout>
 
-Set it up once per laptop as a symlink (so a future `colcon build` of `lupin_bringup` updates it in place):
+Install the chrony oneshot on the robot once (it enables itself and activates on the next reboot; it also disables the stock `makestep`):
+
+```bash
+ssh lupin-wired 'sudo bash -s' < lupin_bringup/scripts/install-clock-sync.sh
+ssh lupin-wired sudo reboot
+```
+
+The `post-boot-sync.sh` fallback is set up once per laptop as a symlink (so a future `colcon build` of `lupin_bringup` updates it in place):
 
 ```bash
 mkdir -p ~/.config/lupin

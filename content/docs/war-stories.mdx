@@ -1,6 +1,6 @@
 ---
 title: War stories
-description: The lived-in Lupin debugging sagas, the wheels that free-spin from a wedged telemetrix board, the 180-degree base frame fixed by a matched pin-swap, the e-stop wired to nothing until estop_bridge, the five layered boot races behind one dead robot, the WiFi roam that masquerades as dead controllers, the multi-homed robot advertising an unroutable DDS locator, the shoulder_lift servo cooking itself against gravity, and the HMI zero-heartbeat that out-votes every drive path.
+description: The lived-in Lupin debugging sagas, the wheels that free-spin from a wedged telemetrix board, the 180-degree base frame fixed by a matched pin-swap, the e-stop wired to nothing until estop_bridge, the five layered boot races behind one dead robot, the WiFi roam that masquerades as dead controllers, the multi-homed robot advertising an unroutable DDS locator, the shoulder_lift servo cooking itself against gravity, the clock-sync service that reported active while the robot ran 84 minutes behind, and the HMI zero-heartbeat that out-votes every drive path.
 ---
 
 These are the scars that taught the design. Every hard-won default in the Lupin stack, the matched pin-swap, the `estop_bridge`, the clock-sync-before-ROS rule, the priority-100 `/cmd_vel_joy` isolation step, exists because a robot once sat dead on a bench and the obvious diagnosis was **wrong**. This page is the story behind the runbook, told as the sagas actually unfolded: the false leads, the real cause, the fix, and the one line each one burned in.
@@ -121,6 +121,30 @@ graph LR
   **Lesson.** A multi-homed robot poisons DDS by advertising an unroutable locator. One-way comms that work for *discovery* but not *data* are the signature, never debug it as a symmetric firewall or a laptop problem. See [Networking](/docs/networking) for the `interfaceWhiteList` pin.
 </Callout>
 
+## The clock-sync service that was "active" and 84 minutes wrong
+
+**Symptom.** A fresh `lupin-clock-sync.service` was installed and enabled to step the robot's dead-RTC clock from the laptop at boot. `systemctl is-active lupin-clock-sync` said `active`, chrony was `active` on *both* machines, and yet the robot sat **84 minutes behind** the laptop. SLAM flooded `Message Filter dropping message`, and every Nav2 goal failed with `Could not transform the start or goal pose` while Nav2 itself reported active. Everything green, the clock simply wrong.
+
+The service ran, and chrony was up on both sides, so the eye goes to Nav2 and TF, the layer actually throwing the error. That is the wrong layer.
+
+**Cause.** Two faults stacked. First, the laptop had chrony *installed and active* but was **not serving**: no `allow` directive, nothing bound on UDP `:123`. *Installed is not serving.* So the robot's oneshot ran, found its only source unreachable (`chronyc -n sources` showed the laptop `^?`, `Reach 0`), and, being soft-by-design so it never blocks boot, proceeded on the stale clock. The `active` unit had done nothing. Second, and far more dangerous: Ubuntu's stock `makestep 1 3` was still in the robot's `/etc/chrony/chrony.conf`, which the sync drop-in never removed. The moment the laptop *did* start serving, the robot's next measurement, 84 minutes off, would hit that rule and **step a live `ros2_control` stack**, the precise controller-wedge the whole design exists to prevent. The service's own comment claimed "chrony only slews mid-session"; on this image that was false.
+
+<Mermaid chart={`
+flowchart TD
+  S["lupin-clock-sync: ACTIVE (a lie)"] --> Q{"is the laptop serving NTP?"}
+  Q -->|"no allow / nothing on :123"| Stale["source ^? Reach 0<br/>oneshot proceeds soft<br/>robot 84 min behind"]
+  Stale --> Nav["SLAM drops msgs · Nav2 goal:<br/>could not transform goal"]
+  Q -->|"fix: allow + local stratum 10"| Sync["robot steps before mirte-ros"]
+  Sync --> Land["stock makestep 1 3 still armed<br/>would step the LIVE stack"]
+  Land -->|"fix: comment out makestep"| Safe["slew-only · controllers safe"]
+`} />
+
+**Fix.** Make the laptop actually serve, `allow 10.42.0.0/24` + `local stratum 10` in a chrony drop-in, restart, confirm `:123` is listening. Comment out the robot's stock `makestep 1 3` so chrony can never step a live stack, and have the installer do it *before* it restarts chrony, or the restart itself trips the step it is meant to prevent. (A third, quieter bug: the sync script's "wait for a solid measurement before stepping" guard read the wrong `chronyc -n sources` column, `$4` Poll instead of `$5` Reach, so it was dead code.) After a reboot the robot disciplines to the laptop before `mirte-ros` starts, drift collapses to microseconds, and the controllers never see a step.
+
+<Callout type="warn">
+  **Lesson.** `active` is a claim about a unit's lifecycle, not about whether it did its job, a clock-sync service that cannot reach a server still reports `active` and proceeds wrong. Verify the *effect* (`chronyc tracking` Reference ID, measured drift), not the service state. And a "safe" mechanism that ships next to a vendor default that contradicts it (`makestep 1 3`) is a landmine: verify the assumption, do not trust the comment. See [Networking](/docs/networking) for the chrony-before-ROS setup.
+</Callout>
+
 ## The servo that cooks itself against gravity
 
 **Symptom.** `shoulder_lift` ignored commands while every other arm joint worked. The joint *above* it, the elbow, moved instead, there was a faint electric noise, and the servo might or might not feel hot. Position readback still streamed, but the arm sagged free under gravity.
@@ -151,7 +175,7 @@ The "raw terminal pub fails too" detail is what makes this so vicious. Bypassing
 
 ## The pattern behind the scars
 
-Read together, these sagas rhyme. Four of them, the wheels, the WiFi roam, the multi-homing, the rosbridge wedge in the [operations runbook](/docs/operations), share one shape: a layer reports **healthy** while the layer below it is dead, and the green light is a lie about something it cannot actually see. The fixes that stuck all moved the truth *down* a level, feel the wheels, read `No route to host`, check the advertised locator, watch the per-joint current. The fixes that failed all tried to compensate *up* a level, the HMI sign flip, the "safer" boot gate, the soft restart.
+Read together, these sagas rhyme. Five of them, the wheels, the WiFi roam, the multi-homing, the clock-sync service, the rosbridge wedge in the [operations runbook](/docs/operations), share one shape: a layer reports **healthy** while the layer below it is dead, and the green light is a lie about something it cannot actually see. The fixes that stuck all moved the truth *down* a level, feel the wheels, read `No route to host`, check the advertised locator, watch the per-joint current. The fixes that failed all tried to compensate *up* a level, the HMI sign flip, the "safer" boot gate, the soft restart.
 
 <Figure src="/war-stories/triage-flow.png" caption="The Lupin triage order distilled from these stories: physical layer first (wheels, power, network route), then DDS graph, then the application, never the reverse." />
 
