@@ -225,7 +225,7 @@ Lupin deliberately splits its runtime across two machines, and the deep point is
 | `arm_preset_server` | `/lupin/arm/preset` named-pose service |
 | `arm_calibrate_server` | `/lupin/arm/calibrate` zero-offset calibration |
 | `gripper_action_bridge` | HMI/voice gripper angle to `GripperCommand` action |
-| `light_strip_bridge` | Mission-state status LED, BRG color remap |
+| `light_strip_bridge` | Status LED — mission palette **plus** live drive/arm/standby/e-stop activity, BRG remap |
 | `estop_bridge` | Physical e-stop button to `/e_stop_state` |
 
 The two service units around it:
