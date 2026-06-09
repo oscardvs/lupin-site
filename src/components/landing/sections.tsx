@@ -55,7 +55,7 @@ function Section({
 
 /* ------------------------------------------------------------------- hero */
 
-const HERO_BADGES = ['ROS 2 Humble', 'Nav2 · MPPI', 'Mecanum base', '16-tool voice', 'Open-source'];
+const HERO_BADGES = ['ROS 2 Humble', 'Nav2 · MPPI', 'Mecanum base', '23-tool voice', 'Open-source'];
 
 export function Hero() {
   return (
@@ -142,7 +142,7 @@ export function Hero() {
 
 const STATS = [
   { v: '9', l: 'ROS 2 packages' },
-  { v: '16', l: 'voice tools' },
+  { v: '23', l: 'voice tools' },
   { v: '10 / 6', l: 'msgs / services' },
   { v: 'MPPI', l: 'omni controller' },
   { v: 'Sim + HW', l: 'one codebase' },
@@ -238,7 +238,7 @@ const FEATURES = [
     Icon: Mic,
     title: 'A voice-controlled console',
     body:
-      'A 16-tool Gemini Live agent drives, navigates, actuates the arm and gripper, throttles its own speed, and trips a software E-stop, every motion gated by the same caps as the joystick.',
+      'A 23-tool Gemini Live agent drives, navigates, actuates the arm and gripper, throttles its own speed, and trips a software E-stop, every motion gated by the same caps as the joystick.',
     href: '/docs/web-hmi',
     featured: true,
   },
